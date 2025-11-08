@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import cv2 as cv
+import numpy as np
+import time
+from collections import deque
+from cv_bridge import CvBridge
+from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import Float64
+
+class LaneFollow:
+    def __init__(self):
+        rospy.init_node('lane_follow')
+        self.cv_bridge = CvBridge()
+
+        # --- ROS I/O ---
+        self.image_sub = rospy.Subscriber(
+            '/usb_cam/image_rect_color/compressed', CompressedImage, self.image_cb, queue_size=1
+        )
+        self.motor_pub = rospy.Publisher('/commands/motor/speed',  Float64, queue_size=10)
+        self.servo_pub = rospy.Publisher('/commands/servo/position', Float64, queue_size=10)
+
+        self.debug_publisher1 = rospy.Publisher('/debugging_image1', Image, queue_size=10)
+        self.debug_publisher2 = rospy.Publisher('/debugging_image2', Image, queue_size=10)
+
+        # --- 파라미터 ---
+        self.img_width  = rospy.get_param('~img_width', 640)
+        self.img_height = rospy.get_param('~img_height', 480)
+
+        # HSV (화이트) 기본값: 상황에 맞게 파라미터로 조정 가능
+        self.white_lower = np.array(rospy.get_param('~white_lower', [0, 0, 180]), dtype=np.uint8)
+        self.white_upper = np.array(rospy.get_param('~white_upper', [180, 70, 255]), dtype=np.uint8)
+
+        # GUI 토글(헤드리스 환경에서 False 권장)
+        self.use_gui = rospy.get_param('~use_gui', False)
+
+        # --- 투시 변환 포인트(640x480 기준값), 실제 해상도에 맞춰 첫 프레임 때 스케일 재계산 ---
+        self.src_points_base = np.float32([
+            [200, 285],
+            [440, 285],
+            [-15, 480],
+            [655, 480]
+        ])
+        self.dst_points_base = np.float32([
+            [130,   0],
+            [510,   0],
+            [130, 480],
+            [510, 480]
+        ])
+        self.matrix = None
+        self.inv_matrix = None
+        self.matrix_ready = False  # 첫 프레임에서 초기화
+
+        # --- PID 제어 파라미터 (dt 반영) ---
+        self.kp = rospy.get_param('~kp', 0.01)
+        self.ki = rospy.get_param('~ki', 0.0001)
+        self.kd = rospy.get_param('~kd', 0.005)
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.prev_steer_angle = 0.0
+        self.prev_time = None
+        self.i_max = rospy.get_param('~i_max', 1e5)  # 앤티윈드업 클램프
+
+        # --- 속도 설계 ---
+        self.base_speed = rospy.get_param('~base_speed', 1.0)
+        self.turn_slowdown_k = rospy.get_param('~turn_slowdown_k', 0.7)
+        self.v_min = rospy.get_param('~v_min', 0.3)
+        self.v_max = rospy.get_param('~v_max', 2.0)
+
+        # --- 서보/모터 변환 + 클리핑 ---
+        self.steer_to_servo_gain   = rospy.get_param('~steer_to_servo_gain', -1.2135)
+        self.steer_to_servo_offset = rospy.get_param('~steer_to_servo_offset', 0.5304)
+        self.speed_to_erpm_gain    = rospy.get_param('~speed_to_erpm_gain', 2000.0)
+        self.speed_to_erpm_offset  = rospy.get_param('~speed_to_erpm_offset', 0.0)
+
+        # (예시 클립 범위: 실제 하드웨어 스펙에 맞게 수정하세요)
+        self.servo_min = rospy.get_param('~servo_min', 0.0)
+        self.servo_max = rospy.get_param('~servo_max', 1.0)
+        self.erpm_min  = rospy.get_param('~erpm_min', -5000.0)
+        self.erpm_max  = rospy.get_param('~erpm_max',  8000.0)
+
+        # --- 최근 차선 저장 (deque, 3초 창) ---
+        self.recent_left_fits  = deque()
+        self.recent_right_fits = deque()
+        self.recent_time_window = rospy.get_param('~recent_time_window', 3.0)  # seconds
+        self.fps_estimate = rospy.get_param('~fps_estimate', 10.0)
+
+        # --- 차선 폭(픽셀) 추정치 유지 (두 차선 동시 검출 시만 갱신) ---
+        self.lane_width_px = rospy.get_param('~lane_width_px_init', 350.0)
+        self.lane_width_alpha = rospy.get_param('~lane_width_alpha', 0.1)  # 지수평균 계수
+
+        # 실측으로 인정할 최소 픽셀 수
+        self.min_lane_pixels = rospy.get_param('~min_lane_pixels', 300)
+
+    # ---------------------------
+    # 콜백
+    # ---------------------------
+    def image_cb(self, image_msg: CompressedImage):
+        now = time.time()
+
+        # 1) 압축 해제
+        bgr = self.cv_bridge.compressed_imgmsg_to_cv2(image_msg, 'bgr8')
+        H, W = bgr.shape[:2]
+        self.img_height, self.img_width = H, W
+
+        # 1-1) 해상도에 맞춰 투시행렬 초기화(최초 1회)
+        if not self.matrix_ready:
+            sx, sy = W / 640.0, H / 480.0
+            src = np.float32([
+                [self.src_points_base[0][0]*sx, self.src_points_base[0][1]*sy],
+                [self.src_points_base[1][0]*sx, self.src_points_base[1][1]*sy],
+                [self.src_points_base[2][0]*sx, self.src_points_base[2][1]*sy],
+                [self.src_points_base[3][0]*sx, self.src_points_base[3][1]*sy],
+            ])
+            dst = np.float32([
+                [self.dst_points_base[0][0]*sx, self.dst_points_base[0][1]*sy],
+                [self.dst_points_base[1][0]*sx, self.dst_points_base[1][1]*sy],
+                [self.dst_points_base[2][0]*sx, self.dst_points_base[2][1]*sy],
+                [self.dst_points_base[3][0]*sx, self.dst_points_base[3][1]*sy],
+            ])
+            self.matrix = cv.getPerspectiveTransform(src, dst)
+            self.inv_matrix = cv.getPerspectiveTransform(dst, src)
+            self.matrix_ready = True
+
+        # 2) 전처리: 블러 + HSV 화이트 마스크 + Morph Close
+        bgr_blur = cv.GaussianBlur(bgr, (5, 5), 0)
+        hsv = cv.cvtColor(bgr_blur, cv.COLOR_BGR2HSV)
+        white_mask = cv.inRange(hsv, self.white_lower, self.white_upper)
+        white_mask = cv.medianBlur(white_mask, 5)
+        white_mask = cv.morphologyEx(
+            white_mask, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (5, 5)), iterations=1
+        )
+
+        # 3) 버드아이 변환
+        warped = cv.warpPerspective(white_mask, self.matrix, (W, H))
+        bgr_warped = cv.warpPerspective(bgr_blur, self.matrix, (W, H))  # (디버깅용)
+
+        # 4) 슬라이딩 윈도우 기반 차선 검출
+        (left_fit, right_fit,
+         left_lane_inds, right_lane_inds,
+         out_img, nonzeroy, nonzerox,
+         left_cnt, right_cnt) = self.sliding_window_polyfit(warped)
+
+        left_measured  = (left_cnt  >= self.min_lane_pixels)
+        right_measured = (right_cnt >= self.min_lane_pixels)
+
+        # 5) 두 쪽 모두 실측일 때만 차선 폭 업데이트(하단 y에서)
+        if left_measured and right_measured:
+            self.update_lane_width_px(left_fit, right_fit, H)
+
+        # 6) 한쪽 소실 시 "반대 차선 복원(오프셋 복사)" 우선
+        if (not left_measured) and right_measured:
+            left_fit = self.synthesize_opposite_lane(right_fit, side='left')
+        elif (not right_measured) and left_measured:
+            right_fit = self.synthesize_opposite_lane(left_fit, side='right')
+        elif (not left_measured) and (not right_measured):
+            # 둘 다 소실이면 직전 값 사용(있다면) 또는 0
+            left_fit = self.predict_missing_lane(self.recent_left_fits)  if len(self.recent_left_fits)  > 0 else np.array([0,0,0], dtype=np.float32)
+            right_fit = self.predict_missing_lane(self.recent_right_fits) if len(self.recent_right_fits) > 0 else np.array([0,0,0], dtype=np.float32)
+
+        # 7) 최근 deque 업데이트(실측값만 저장; 예측값은 절대 저장 X)
+        self.update_recent_fits(left_fit if left_measured else None,
+                                right_fit if right_measured else None,
+                                now)
+
+        # 8) 차선 중심 계산 (하단 y에서 평가) + 오차
+        y_eval = H - 1
+        lane_center = self.calculate_lane_center(left_fit, right_fit, y_eval)
+        image_center = W / 2.0
+        error = image_center - lane_center  # (+)면 오른쪽으로 이동 필요
+
+        # 9) PID 제어 (dt 반영)
+        steer_angle = self.pid_control(error)
+
+        # 10) 속도 조절
+        speed = self.adjust_speed(steer_angle)
+
+        # 11) 모터/서보 발행 (클리핑)
+        self.publish_controls(steer_angle, speed)
+
+        # 12) 디버깅 이미지
+        debug_img1 = self.create_debug_image(out_img, left_lane_inds, right_lane_inds, nonzeroy, nonzerox)
+        debug_img_msg1 = self.cv_bridge.cv2_to_imgmsg(debug_img1, encoding="bgr8")
+        self.debug_publisher1.publish(debug_img_msg1)
+
+        debug_img2 = self.create_lane_overlay(bgr, left_fit, right_fit)
+        debug_img_msg2 = self.cv_bridge.cv2_to_imgmsg(debug_img2, encoding="bgr8")
+        self.debug_publisher2.publish(debug_img_msg2)
+
+        if self.use_gui:
+            cv.imshow('Warped', warped)
+            cv.imshow('Debug1', debug_img1)
+            cv.imshow('Debug2 - Lane Overlay', debug_img2)
+            cv.waitKey(1)
+
+    # ---------------------------
+    # 투시/검출/보정 유틸
+    # ---------------------------
+    def sliding_window_polyfit(self, binary_warped):
+        """
+        반환: left_fit, right_fit, left_inds, right_inds, out_img, nonzeroy, nonzerox, left_cnt, right_cnt
+        """
+        histogram = np.sum(binary_warped[binary_warped.shape[0]//2:, :], axis=0)
+        midpoint = np.int32(histogram.shape[0] // 2)
+        leftx_base = int(np.argmax(histogram[:midpoint]))
+        rightx_base = int(np.argmax(histogram[midpoint:]) + midpoint)
+
+        nwindows = 9
+        window_height = int(binary_warped.shape[0] // nwindows)
+        nonzero = binary_warped.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+
+        margin = 100
+        minpix = 50
+
+        leftx_current = leftx_base
+        rightx_current = rightx_base
+
+        left_lane_inds = []
+        right_lane_inds = []
+
+        out_img = np.dstack((binary_warped, binary_warped, binary_warped)) * 255
+
+        H, W = binary_warped.shape[:2]
+        hist_sum = histogram.sum()
+        # 히스토그램 너무 빈약하면 실패로 처리해도 됨 (옵션)
+        # if hist_sum < 1e3: ...
+
+        for window in range(nwindows):
+            win_y_low  = H - (window + 1) * window_height
+            win_y_high = H - window * window_height
+            win_xleft_low  = leftx_current - margin
+            win_xleft_high = leftx_current + margin
+            win_xright_low  = rightx_current - margin
+            win_xright_high = rightx_current + margin
+
+            cv.rectangle(out_img, (win_xleft_low,  win_y_low),
+                         (win_xleft_high, win_y_high), (0, 255, 0), 2)
+            cv.rectangle(out_img, (win_xright_low,  win_y_low),
+                         (win_xright_high, win_y_high), (0, 255, 0), 2)
+
+            good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                              (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+            good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                               (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+
+            left_lane_inds.append(good_left_inds)
+            right_lane_inds.append(good_right_inds)
+
+            if len(good_left_inds) > minpix:
+                leftx_current = int(np.mean(nonzerox[good_left_inds]))
+            if len(good_right_inds) > minpix:
+                rightx_current = int(np.mean(nonzerox[good_right_inds]))
+
+        left_lane_inds = np.concatenate(left_lane_inds) if len(left_lane_inds) > 0 else np.array([], dtype=int)
+        right_lane_inds = np.concatenate(right_lane_inds) if len(right_lane_inds) > 0 else np.array([], dtype=int)
+
+        leftx = nonzerox[left_lane_inds] if left_lane_inds.size > 0 else np.array([])
+        lefty = nonzeroy[left_lane_inds] if left_lane_inds.size > 0 else np.array([])
+        rightx = nonzerox[right_lane_inds] if right_lane_inds.size > 0 else np.array([])
+        righty = nonzeroy[right_lane_inds] if right_lane_inds.size > 0 else np.array([])
+
+        left_fit = np.array([0, 0, 0], dtype=np.float32)
+        right_fit = np.array([0, 0, 0], dtype=np.float32)
+
+        if len(leftx) > 0 and len(lefty) > 0:
+            left_fit = np.polyfit(lefty, leftx, 2).astype(np.float32)
+        if len(rightx) > 0 and len(righty) > 0:
+            right_fit = np.polyfit(righty, rightx, 2).astype(np.float32)
+
+        # 픽셀 카운트 반환(실측 여부 판단용)
+        left_cnt = int(len(left_lane_inds))
+        right_cnt = int(len(right_lane_inds))
+
+        return left_fit, right_fit, left_lane_inds, right_lane_inds, out_img, nonzeroy, nonzerox, left_cnt, right_cnt
+
+    def update_recent_fits(self, left_fit, right_fit, now):
+        # 실측값만 들어오도록 호출부에서 보장
+        if left_fit is not None and not np.all(left_fit == 0):
+            self.recent_left_fits.append((left_fit, now))
+        if right_fit is not None and not np.all(right_fit == 0):
+            self.recent_right_fits.append((right_fit, now))
+
+        # 3초 창 관리
+        maxlen = int(self.fps_estimate * self.recent_time_window)
+        self.recent_left_fits  = deque([(f, t) for (f, t) in self.recent_left_fits  if now - t <= self.recent_time_window],
+                                       maxlen=maxlen)
+        self.recent_right_fits = deque([(f, t) for (f, t) in self.recent_right_fits if now - t <= self.recent_time_window],
+                                       maxlen=maxlen)
+
+    def predict_missing_lane(self, recent_fits):
+        """해당쪽 히스토리 기반 예측. (오염방지: 실측만 저장해두었기 때문에 안전)"""
+        if len(recent_fits) == 0:
+            return np.array([0, 0, 0], dtype=np.float32)
+        all_y, all_x = [], []
+        for fit, _ in recent_fits:
+            ploty = np.linspace(0, self.img_height - 1, self.img_height)
+            fitx = np.polyval(fit, ploty)
+            all_y.extend(ploty)
+            all_x.extend(fitx)
+        pred_fit = np.polyfit(all_y, all_x, 2)
+        return pred_fit.astype(np.float32)
+
+    def update_lane_width_px(self, left_fit, right_fit, H):
+        """두 차선이 동시 실측됐을 때 하단 y에서 픽셀 폭을 지수평균으로 갱신"""
+        y_eval = H - 1
+        lx = float(np.polyval(left_fit,  y_eval))
+        rx = float(np.polyval(right_fit, y_eval))
+        width_now = rx - lx  # 오른쪽 - 왼쪽
+        # 비정상 값 필터링 (상황에 맞게 조정)
+        if 80.0 < width_now < 1000.0:
+            a = self.lane_width_alpha
+            self.lane_width_px = (1 - a) * self.lane_width_px + a * width_now
+
+    def synthesize_opposite_lane(self, detected_fit, side: str):
+        """
+        한쪽만 실측됐을 때, 반대편은 c항에 ±lane_width_px만 적용해 복원.
+        side='left'  -> 왼쪽 차선을 만들고 싶을 때 (오른쪽 실측 기준 c - width)
+        side='right' -> 오른쪽 차선을 만들고 싶을 때 (왼쪽  실측 기준 c + width)
+        """
+        a, b, c = float(detected_fit[0]), float(detected_fit[1]), float(detected_fit[2])
+        if side == 'left':
+            c_new = c - self.lane_width_px
+        else:
+            c_new = c + self.lane_width_px
+        return np.array([a, b, c_new], dtype=np.float32)
+
+    # ---------------------------
+    # 제어/속도
+    # ---------------------------
+    def calculate_lane_center(self, left_fit, right_fit, y_eval):
+        left_x  = float(np.polyval(left_fit,  y_eval))
+        right_x = float(np.polyval(right_fit, y_eval))
+        return (left_x + right_x) / 2.0
+
+    def pid_control(self, error):
+        now = time.time()
+        if self.prev_time is None:
+            dt = 1e-3
+        else:
+            dt = max(1e-3, now - self.prev_time)
+
+        # PI(D) with dt
+        self.integral += error * dt
+        # anti-windup
+        self.integral = max(-self.i_max, min(self.i_max, self.integral))
+
+        derivative = (error - self.prev_error) / dt
+
+        steer = self.kp * error + self.ki * self.integral + self.kd * derivative
+
+        # 저역통과로 부드럽게
+        alpha = 0.7
+        steer = alpha * steer + (1 - alpha) * self.prev_steer_angle
+
+        self.prev_error = error
+        self.prev_steer_angle = steer
+        self.prev_time = now
+        return steer
+
+    def adjust_speed(self, steer_angle):
+        speed = self.base_speed * (1.0 - self.turn_slowdown_k * abs(steer_angle))
+        return max(self.v_min, min(self.v_max, speed))
+
+    def publish_controls(self, steer_angle, speed):
+        servo_cmd = self.steer_to_servo_gain * steer_angle + self.steer_to_servo_offset
+        motor_cmd = speed * self.speed_to_erpm_gain + self.speed_to_erpm_offset
+
+        # 범위 클리핑(하드웨어에 맞게)
+        servo_cmd = max(self.servo_min, min(self.servo_max, servo_cmd))
+        motor_cmd = max(self.erpm_min,  min(self.erpm_max,  motor_cmd))
+
+        self.servo_pub.publish(Float64(servo_cmd))
+        self.motor_pub.publish(Float64(motor_cmd))
+
+    # ---------------------------
+    # 디버깅 이미지
+    # ---------------------------
+    def create_debug_image(self, out_img, left_lane_inds, right_lane_inds, nonzeroy, nonzerox):
+        img = out_img.copy()
+        # 왼쪽: 파란, 오른쪽: 빨강
+        if left_lane_inds.size > 0:
+            img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
+        if right_lane_inds.size > 0:
+            img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
+        return img
+
+    def create_lane_overlay(self, orig_img, left_fit, right_fit):
+        overlay = orig_img.copy()
+        H, W = orig_img.shape[:2]
+        ploty = np.linspace(0, H - 1, H)
+        color_warp = np.zeros_like(orig_img)
+
+        left_valid  = left_fit  is not None and not np.all(left_fit  == 0)
+        right_valid = right_fit is not None and not np.all(right_fit == 0)
+
+        if left_valid and right_valid:
+            left_fitx  = np.polyval(left_fit,  ploty)
+            right_fitx = np.polyval(right_fit, ploty)
+
+            pts_left  = np.transpose(np.vstack([left_fitx,  ploty]))
+            pts_right = np.transpose(np.vstack([right_fitx, ploty]))
+
+            pts_polygon = np.vstack([pts_left, np.flipud(pts_right)])
+            cv.fillPoly(color_warp, np.int32([pts_polygon]), color=(0, 255, 0))
+        elif left_valid:
+            pts_left_only = np.array([np.transpose(np.vstack([np.polyval(left_fit, ploty), ploty]))])
+            cv.polylines(color_warp, np.int32([pts_left_only]), isClosed=False, color=(0, 255, 255), thickness=10)
+        elif right_valid:
+            pts_right_only = np.array([np.transpose(np.vstack([np.polyval(right_fit, ploty), ploty]))])
+            cv.polylines(color_warp, np.int32([pts_right_only]), isClosed=False, color=(0, 255, 255), thickness=10)
+
+        newwarp = cv.warpPerspective(color_warp, self.inv_matrix, (W, H))
+        cv.addWeighted(newwarp, 0.3, overlay, 1.0, 0, overlay)
+        return overlay
+
+
+if __name__ == '__main__':
+    try:
+        lf = LaneFollow()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
