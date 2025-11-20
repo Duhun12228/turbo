@@ -1,13 +1,13 @@
-# turbo
-List:
+# turbo <br>
+List:<br>
 Basic: lanefollow.py
-Mission 1: zone.py
-Mission 2: crosswalk.py
-_____________________________
-Mission 3: cone 
-Mission 4: left/right
-Mission 5: roundabout
-Mission 6: cone
-Mission 7: tunnel
-Mission 8: static obstacle
-Mission 9: parking
+<br>Mission 1: zone.py
+<br>Mission 2: crosswalk.py
+<br>_____________________________
+<br>Mission 3: cone 
+<br>Mission 4: left/right
+<br>Mission 5: roundabout
+<br>Mission 6: cone
+<br>Mission 7: tunnel
+<br>Mission 8: static obstacle
+<br>Mission 9: parking
