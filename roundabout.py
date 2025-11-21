@@ -11,99 +11,78 @@ from visualization_msgs.msg import Marker
 
 class Mission5Roundabout:
     def __init__(self):
-        rospy.loginfo("=== Mission 5: Roundabout (Dynamic-Car Only) ===")
+        rospy.loginfo("=== Mission 5: Roundabout (Dynamic + Must See First Car + Multi-Car Safe) ===")
 
         # ---------------------------------------------------------
-        # ROUNDABOUT PARAMETERS (miniature)
+        # Miniature roundabout parameters
         # ---------------------------------------------------------
-        # Lidar forward direction = 180 deg
-        self.FRONT_CENTER = math.pi  # 180°
+        self.FRONT_CENTER = math.pi                # 180° = forward
+        self.ROI_HALF_WIDTH = math.radians(15)     # small window
+        self.BLOCK_DIST = 0.35                     # very close car
+        self.SAFE_DIST = 0.55                      # car passed if > 55cm
+        self.STATIC_VEL_THRESH = 0.005             # slow car still counts
+        self.APPROACH_VEL = -0.03                  # approaching threshold
 
-        # Very narrow conflict zone (12°)
-        self.ROI_HALF_WIDTH = math.radians(12)
+        # Timing parameters
+        self.MIN_CLEAR_TIME = 1.0                  # time of clear zone before GO
+        self.COMMIT_TIME = 3.0                     # commit to entering
 
-        # Distances suitable for miniature roundabout
-        self.BLOCK_DIST = 0.35     # too close = danger
-        self.SAFE_DIST  = 0.55     # gap begins after car passes
-
-        # Velocity thresholds
-        # Static objects: |vel| < 0.02 m/s (ignore)
-        self.STATIC_VELOCITY = 0.02
-        self.APPROACH_VEL = -0.03   # approaching vehicle
-
-        # Time logic
-        self.MIN_CLEAR_TIME = 1.0
-        self.COMMIT_TIME = 3.0
-
-        # ERPM and steering
-        self.ERPM_STOP = 0.0
+        # Speed and steering
         self.ERPM_WAIT = 0.0
-        self.ERPM_GO   = 1200.0       # safe accelerate into roundabout
-        self.STEER_CENTER = 0.5      # straight
+        self.ERPM_GO   = 1200.0
+        self.ERPM_STOP = 0.0
+        self.STEER_CENTER = 0.5
 
-        # State variables
+        # Internal state
         self.mode = "WAIT"
         self.seen_first_car = False
-
-        self.last_dist = None
-        self.last_time = None
         self.clear_start_time = None
         self.go_start_time = None
+        self.last_dist = None
+        self.last_time = None
 
-        # ---------------------------------------------------------
         # ROS I/O
-        # ---------------------------------------------------------
         rospy.Subscriber("/scan", LaserScan, self.scan_callback)
-
         self.speed_pub = rospy.Publisher("/commands/motor/speed", Float64, queue_size=1)
         self.steer_pub = rospy.Publisher("/commands/servo/position", Float64, queue_size=1)
-
         self.marker_pub = rospy.Publisher("/mission5_marker", Marker, queue_size=1)
         self.text_pub   = rospy.Publisher("/mission5_text", Marker, queue_size=1)
 
-        rospy.Timer(rospy.Duration(0.05), self.update)  # 20 Hz
+        rospy.Timer(rospy.Duration(0.05), self.update)
 
 
-    # ======================================================
-    # LIDAR processing
-    # ======================================================
+    # =====================================================================
     def scan_callback(self, scan):
         self.scan = scan
 
-    def get_roi(self):
-        """Return nearest moving object distance + velocity OR (None,None)."""
+    # =====================================================================
+    def get_dynamic_object(self):
+        """Return (dist, vel) of a dynamic object OR (None, None)."""
 
         if not hasattr(self, "scan"):
             return None, None
 
-        # Extract ranges and angles
         ranges = np.array(self.scan.ranges, dtype=float)
         angles = self.scan.angle_min + np.arange(len(ranges)) * self.scan.angle_increment
+        mask = np.isfinite(ranges)
+        ranges = ranges[mask]
+        angles = angles[mask]
 
-        mask_valid = np.isfinite(ranges)
-        ranges = ranges[mask_valid]
-        angles = angles[mask_valid]
-
-        # Angular difference from front (180°)
-        diff = np.arctan2(
-            np.sin(angles - self.FRONT_CENTER),
-            np.cos(angles - self.FRONT_CENTER)
-        )
+        diff = np.arctan2(np.sin(angles - self.FRONT_CENTER),
+                          np.cos(angles - self.FRONT_CENTER))
 
         # Filter ROI
-        roi = ranges[np.abs(diff) < self.ROI_HALF_WIDTH]
-
-        if len(roi) == 0:
+        roi_ranges = ranges[np.abs(diff) < self.ROI_HALF_WIDTH]
+        if len(roi_ranges) == 0:
             self.last_dist = None
             self.last_time = rospy.Time.now().to_sec()
             return None, None
 
-        nearest = float(np.min(roi))
+        nearest = float(np.min(roi_ranges))
         now = rospy.Time.now().to_sec()
 
-        # Compute velocity
         vel = None
-        if self.last_dist is not None and self.last_time is not None:
+        if self.last_dist is not None:
             dt = now - self.last_time
             if dt > 1e-3:
                 vel = (nearest - self.last_dist) / dt
@@ -111,22 +90,19 @@ class Mission5Roundabout:
         self.last_dist = nearest
         self.last_time = now
 
-        # -----------------------------------------------
-        # IGNORE STATIC OBJECTS
-        # -----------------------------------------------
-        # If it doesn’t move → it is a wall, cone, barrier, etc.
-        if vel is not None and abs(vel) < self.STATIC_VELOCITY:
+        # -------- IGNORE STATIC OBJECTS --------
+        if vel is not None and abs(vel) < self.STATIC_VEL_THRESH:
             return None, None
 
-        # Only dynamic objects matter
+        # Car too far → ignore (track too small)
+        if nearest > 0.9:
+            return None, None
+
         return nearest, vel
 
-
-    # ======================================================
-    # RVIZ VISUALIZATION
-    # ======================================================
+    # =====================================================================
     def show_marker(self, dist, color, text):
-        # Sphere
+        """Visual debug sphere + text."""
         m = Marker()
         m.header.frame_id = "laser"
         m.type = Marker.SPHERE
@@ -135,111 +111,95 @@ class Mission5Roundabout:
         m.color.a = 1.0
 
         x = 0.5 if dist is None else dist
-        m.pose.position.x = -x  # flip for front-facing
-        m.pose.position.y = 0
-        m.pose.position.z = 0
+        m.pose.position.x = -x      # flip for visualization
+        m.pose.position.y = 0.0
         self.marker_pub.publish(m)
 
-        # Text
         t = Marker()
         t.header.frame_id = "laser"
         t.type = Marker.TEXT_VIEW_FACING
         t.scale.z = 0.25
         t.color.r = t.color.g = t.color.b = 1.0
         t.color.a = 1.0
-        t.pose.position.x = 0
-        t.pose.position.y = 0
+        t.pose.position.x = 0.0
+        t.pose.position.y = 0.0
         t.pose.position.z = 0.5
         t.text = text
         self.text_pub.publish(t)
 
-
-    # ======================================================
-    # MAIN LOOP
-    # ======================================================
+    # =====================================================================
     def update(self, event):
-
-        # Keep steering straight
-        self.steer_pub.publish(Float64(self.STEER_CENTER))
-
-        dist, vel = self.get_roi()
+        self.steer_pub.publish(Float64(self.STEER_CENTER))  # keep straight
+        dist, vel = self.get_dynamic_object()
 
         if self.mode == "WAIT":
             self.wait_mode(dist, vel)
-        elif self.mode == "GO":
+        else:
             self.go_mode()
 
-
-    # ======================================================
-    # WAIT MODE
-    # ======================================================
+    # =====================================================================
     def wait_mode(self, dist, vel):
 
+        # Always stop in wait mode
         self.speed_pub.publish(Float64(self.ERPM_WAIT))
 
-        # No dynamic object detected
-        if dist is None:
-            # Must see first car before entering
-            if not self.seen_first_car:
-                self.show_marker(None, (1,1,0), "WAIT (must see car)")
-                return
-
-            # Now performing gap detection
-            if self.clear_start_time is None:
-                self.clear_start_time = rospy.Time.now().to_sec()
-
-            t_clear = rospy.Time.now().to_sec() - self.clear_start_time
-            self.show_marker(None, (0,1,0), f"CLEAR {t_clear:.1f}s")
-
-            if t_clear > self.MIN_CLEAR_TIME:
-                self.start_go()
+        # ------------------------------------------------------------
+        # 1) WAIT UNTIL FIRST MOVING CAR IS SEEN
+        # ------------------------------------------------------------
+        if not self.seen_first_car:
+            if dist is not None:    # first dynamic object seen
+                self.seen_first_car = True
+                self.show_marker(dist, (1, 0, 0), f"FIRST CAR d={dist:.2f}")
+            else:
+                self.show_marker(None, (1, 1, 0), "WAIT (must see a car)")
             return
 
-        # A moving object is detected here
-        self.seen_first_car = True
-        self.clear_start_time = None
+        # ------------------------------------------------------------
+        # 2) AFTER FIRST CAR IS SEEN → NOW HANDLE MULTIPLE CARS
+        # ------------------------------------------------------------
 
-        # Too close → WAIT
-        if dist < self.BLOCK_DIST:
-            self.show_marker(dist, (1,0,0), f"WAIT close d={dist:.2f}")
+        # If a car is detected now → must wait
+        if dist is not None:
+            if vel is not None and vel < self.APPROACH_VEL:
+                self.show_marker(dist, (1,0,0), f"APPROACH d={dist:.2f}")
+            elif dist < self.BLOCK_DIST:
+                self.show_marker(dist, (1,0,0), f"TOO CLOSE d={dist:.2f}")
+            else:
+                self.show_marker(dist, (1,0,0), f"CAR PRESENT d={dist:.2f}")
+
+            self.clear_start_time = None
             return
 
-        # Approaching → WAIT
-        if vel is not None and vel < self.APPROACH_VEL:
-            self.show_marker(dist, (1,0,0), f"APPROACH d={dist:.2f}")
-            return
-
-        # Dynamic car present but moving away or stable → form gap
+        # ------------------------------------------------------------
+        # 3) NO CARS IN ROI → possibly a GAP
+        # ------------------------------------------------------------
         if self.clear_start_time is None:
             self.clear_start_time = rospy.Time.now().to_sec()
 
         t_clear = rospy.Time.now().to_sec() - self.clear_start_time
-        self.show_marker(dist, (0,1,0), f"GAP {t_clear:.1f}s")
+        self.show_marker(None, (0,1,0), f"GAP {t_clear:.2f}s")
 
-        if t_clear > self.MIN_CLEAR_TIME:
+        if t_clear >= self.MIN_CLEAR_TIME:
             self.start_go()
 
-
-    # ======================================================
-    # GO MODE
-    # ======================================================
+    # =====================================================================
     def start_go(self):
-        rospy.loginfo("[Mission5] GO — Gap confirmed.")
+        rospy.loginfo("[Mission5] GO — clear gap after first car.")
         self.mode = "GO"
         self.go_start_time = rospy.Time.now().to_sec()
 
+    # =====================================================================
     def go_mode(self):
         t = rospy.Time.now().to_sec() - self.go_start_time
-        self.show_marker(0.5, (0,0,1), f"GO {t:.1f}s")
         self.speed_pub.publish(Float64(self.ERPM_GO))
+        self.show_marker(0.4, (0,0,1), f"GO {t:.1f}s")
 
-        if t > self.COMMIT_TIME:
-            rospy.loginfo("[Mission5] Commit done → STOP.")
+        if t >= self.COMMIT_TIME:
             self.speed_pub.publish(Float64(self.ERPM_STOP))
+            self.show_marker(None, (0,0,1), "DONE")
 
 
 if __name__ == "__main__":
     rospy.init_node("roundabout")
     Mission5Roundabout()
     rospy.spin()
-
