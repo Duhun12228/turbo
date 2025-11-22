@@ -1,68 +1,76 @@
-import cv2 as cv
-import numpy as np
+def sliding_window(self, img, n_windows=10, margin=12, minpix=5):
+    y = img.shape[0]
+    x = img.shape[1]
 
-def detect_left_lane_break(lane_bin,
-                           x_left_center,
-                           margin_px=20,
-                           min_valid_run=40,
-                           min_break_run=40):
-    """
-    lane_bin      : bird-eye + white filter 후 이진 이미지 (0/255, shape=(h,w))
-    x_left_center : 왼쪽 차선 예상 x 위치 (픽셀)
-    margin_px     : 차선 주변으로 잡을 가로 폭 (± margin)
-    min_valid_run : 아래쪽에서 '연속으로 차선이 있는' 최소 줄 수
-    min_break_run : 그 위에서 '연속으로 차선이 없는' 최소 줄 수
-    
-    return: (is_broken, y_break_start, y_break_end)
-            is_broken: bool (왼쪽 차선이 끊긴 상태인지)
-            y_break_start, y_break_end: 끊긴 구간의 y 범위 (없으면 None)
-    """
+    histogram = np.sum(img[y//2:, :], axis=0)
+    midpoint = int(histogram.shape[0] / 2)
+    leftx_current = np.argmax(histogram[:midpoint])
+    rightx_current = np.argmax(histogram[midpoint:]) + midpoint
 
-    h, w = lane_bin.shape[:2]
+    window_height = int(y / n_windows)
+    nz = img.nonzero()
 
-    # 1) 왼쪽 차선 주변 가로 ROI 설정
-    x1 = max(0, int(x_left_center - margin_px))
-    x2 = min(w, int(x_left_center + margin_px))
+    left_lane_inds = []
+    right_lane_inds = []
 
-    roi = lane_bin[:, x1:x2]  # 전체 높이, 가로만 좁힘
+    lx, ly, rx, ry = [], [], [], []
 
-    has_line = []  # 각 y에 대해, 차선 픽셀 존재 여부(True/False)
+    out_img = np.dstack((img, img, img)) * 255
 
-    # 2) 아래에서 위로 한 줄씩 스캔
-    for y in range(h-1, -1, -1):  # h-1 → 0
-        row = roi[y, :]
-        # 이 줄에 흰 픽셀이 하나라도 있으면 "라인 있음"
-        has_line.append(cv.countNonZero(row) > 0)
+    for window in range(n_windows):
 
-    # 이제 has_line[0]은 맨 아래줄, has_line[-1]은 맨 윗줄
+        win_yl = y - (window + 1) * window_height
+        win_yh = y - window * window_height
 
-    # 3) 아래쪽에서 연속으로 라인이 있는 구간 길이 측정
-    valid_run = 0
-    idx = 0
-    while idx < len(has_line) and has_line[idx]:
-        valid_run += 1
-        idx += 1
+        win_xll = leftx_current - margin  # 녹색사각형 크기 : 가로 24, 세로 26
+        win_xlh = leftx_current + margin
+        win_xrl = rightx_current - margin
+        win_xrh = rightx_current + margin
 
-    # 왼쪽 차선을 아예 못 보고 있는 상황이면 끊김 판단 X
-    if valid_run < min_valid_run:
-        return False, None, None
+        cv.rectangle(out_img, (win_xll, win_yl), (win_xlh, win_yh), (0, 255, 0), 2)
+        cv.rectangle(out_img, (win_xrl, win_yl), (win_xrh, win_yh), (0, 255, 0), 2)
 
-    # 4) 그 위에서 연속으로 라인이 '없는' 구간 길이 측정
-    break_run = 0
-    break_start_idx = None
+        # 슬라이딩 윈도우 박스(녹색박스) 하나 안에 있는 흰색 픽셀의 x좌표를 모두 모은다.
+        good_left_inds = ((nz[0] >= win_yl) & (nz[0] < win_yh) &
+                          (nz[1] >= win_xll) & (nz[1] < win_xlh)).nonzero()[0]
+        good_right_inds = ((nz[0] >= win_yl) & (nz[0] < win_yh) &
+                           (nz[1] >= win_xrl) & (nz[1] < win_xrh)).nonzero()[0]
 
-    while idx < len(has_line) and not has_line[idx]:
-        if break_run == 0:
-            break_start_idx = idx
-        break_run += 1
-        idx += 1
+        left_lane_inds.append(good_left_inds)
+        right_lane_inds.append(good_right_inds)
 
-    # 충분히 긴 '없는' 구간이 있으면 → 선이 끊긴 것으로 판단
-    if break_run >= min_break_run:
-        # 인덱스를 다시 y 좌표로 변환
-        # has_line[0]은 y = h-1
-        y_break_start = h-1 - break_start_idx
-        y_break_end   = h-1 - (break_start_idx + break_run - 1)
-        return True, y_break_start, y_break_end
+        # 구한 x좌표 리스트에서 흰색점이 5개 이상인 경우에 한해 x 좌표의 평균값을 구함. -> 이 값을 슬라이딩 윈도우의 중심점으로 사용
+        if len(good_left_inds) > minpix:
+            leftx_current = int(np.mean(nz[1][good_left_inds]))
+        if len(good_right_inds) > minpix:
+            rightx_current = int(np.mean(nz[1][good_right_inds]))
 
-    return False, None, None
+        # 여기까지는 기존대로 left, right 중심점 계속 추적
+        lx.append(leftx_current)
+        ly.append((win_yl + win_yh) / 2)
+
+        rx.append(rightx_current)
+        ry.append((win_yl + win_yh) / 2)
+
+    left_lane_inds = np.concatenate(left_lane_inds)
+    right_lane_inds = np.concatenate(right_lane_inds)
+
+    # ===== 여기부터 변경 포인트 =====
+    # 오른쪽 차선은 실제 검출값으로 직선 피팅
+    rfit = np.polyfit(np.array(ry), np.array(rx), 1)
+    a_r, b_r = rfit  # x = a_r * y + b_r
+
+    # 프레임 가로의 절반만큼 왼쪽으로 평행 이동한 가상 왼쪽 차선
+    # x_left(y) = a_r * y + (b_r - x/2)
+    offset = x / 2.0
+    lfit = np.array([a_r, b_r - offset])
+    # ===== 변경 끝 =====
+
+    # 왼쪽과 오른쪽 각각 파란색과 빨간색으로 색상 변경 (시각화 용도는 그대로 둠)
+    out_img[nz[0][left_lane_inds], nz[1][left_lane_inds]] = [255, 0, 0]
+    out_img[nz[0][right_lane_inds], nz[1][right_lane_inds]] = [0, 0, 255]
+
+    cv.imshow("viewer", out_img)
+    self.debug_publisher1.publish(self.cv_bridge.cv2_to_imgmsg(out_img))
+
+    return lfit, rfit
