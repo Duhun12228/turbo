@@ -1,0 +1,68 @@
+import cv2 as cv
+import numpy as np
+
+def detect_left_lane_break(lane_bin,
+                           x_left_center,
+                           margin_px=20,
+                           min_valid_run=40,
+                           min_break_run=40):
+    """
+    lane_bin      : bird-eye + white filter 후 이진 이미지 (0/255, shape=(h,w))
+    x_left_center : 왼쪽 차선 예상 x 위치 (픽셀)
+    margin_px     : 차선 주변으로 잡을 가로 폭 (± margin)
+    min_valid_run : 아래쪽에서 '연속으로 차선이 있는' 최소 줄 수
+    min_break_run : 그 위에서 '연속으로 차선이 없는' 최소 줄 수
+    
+    return: (is_broken, y_break_start, y_break_end)
+            is_broken: bool (왼쪽 차선이 끊긴 상태인지)
+            y_break_start, y_break_end: 끊긴 구간의 y 범위 (없으면 None)
+    """
+
+    h, w = lane_bin.shape[:2]
+
+    # 1) 왼쪽 차선 주변 가로 ROI 설정
+    x1 = max(0, int(x_left_center - margin_px))
+    x2 = min(w, int(x_left_center + margin_px))
+
+    roi = lane_bin[:, x1:x2]  # 전체 높이, 가로만 좁힘
+
+    has_line = []  # 각 y에 대해, 차선 픽셀 존재 여부(True/False)
+
+    # 2) 아래에서 위로 한 줄씩 스캔
+    for y in range(h-1, -1, -1):  # h-1 → 0
+        row = roi[y, :]
+        # 이 줄에 흰 픽셀이 하나라도 있으면 "라인 있음"
+        has_line.append(cv.countNonZero(row) > 0)
+
+    # 이제 has_line[0]은 맨 아래줄, has_line[-1]은 맨 윗줄
+
+    # 3) 아래쪽에서 연속으로 라인이 있는 구간 길이 측정
+    valid_run = 0
+    idx = 0
+    while idx < len(has_line) and has_line[idx]:
+        valid_run += 1
+        idx += 1
+
+    # 왼쪽 차선을 아예 못 보고 있는 상황이면 끊김 판단 X
+    if valid_run < min_valid_run:
+        return False, None, None
+
+    # 4) 그 위에서 연속으로 라인이 '없는' 구간 길이 측정
+    break_run = 0
+    break_start_idx = None
+
+    while idx < len(has_line) and not has_line[idx]:
+        if break_run == 0:
+            break_start_idx = idx
+        break_run += 1
+        idx += 1
+
+    # 충분히 긴 '없는' 구간이 있으면 → 선이 끊긴 것으로 판단
+    if break_run >= min_break_run:
+        # 인덱스를 다시 y 좌표로 변환
+        # has_line[0]은 y = h-1
+        y_break_start = h-1 - break_start_idx
+        y_break_end   = h-1 - (break_start_idx + break_run - 1)
+        return True, y_break_start, y_break_end
+
+    return False, None, None
