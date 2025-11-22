@@ -26,12 +26,11 @@ class LaneFollow:
             '/mission_num', Float64, self.mission_cb, queue_size=1)
         self.mission_pub = rospy.Publisher('/mission_num', Float64, queue_size=10)
 
-        self.motor_pub = rospy.Publisher('/commands/motor/speed',  Float64, queue_size=10)
-        self.servo_pub = rospy.Publisher('/commands/servo/position', Float64, queue_size=10)
         self.ack_pub = rospy.Publisher('/high_level/ackermann_cmd_mux/input/nav_0', AckermannDriveStamped, queue_size=10)
         self.ack_pub_1 = rospy.Publisher('/high_level/ackermann_cmd_mux/input/nav_1', AckermannDriveStamped, queue_size=10)
         
         self.roi_img_pub = rospy.Publisher('/roi_img', Image, queue_size=10)
+        self.binary_img_pub = rospy.Publisher('/binary_img',Image,queue_size = 10)
 
         self.debug_publisher1 = rospy.Publisher('/debugging_image1', Image, queue_size=10)
         self.debug_publisher2 = rospy.Publisher('/debugging_image2', Image, queue_size=10)
@@ -305,10 +304,15 @@ class LaneFollow:
         self.warp_img0 = self.warpping(self.bgr) 
         self.warp_img = self.roi_set(self.warp_img0)       
         g_filtered = self.Gaussian_filter(self.warp_img)
+        
         self.roi_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(g_filtered, "bgr8"))
         self.gear = 3
         self.white_img = self.white_color_filter_hsv(g_filtered)
-        self.filtered_img = self.binary_filter(self.white_img)             
+        
+        
+        self.filtered_img = self.binary_filter(self.white_img)     
+        self.binary_img_pub.publish(self.cv_bridge.cv2_to_imgmsg(self.filtered_img))
+
         lfit, rfit = self.sliding_window(self.filtered_img)
         #
         # print(f'lfit: {lfit}, rfit: {rfit}')
