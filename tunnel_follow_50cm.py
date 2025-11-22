@@ -49,7 +49,7 @@ class TunnelFollower50cm:
         self.viz_pub = rospy.Publisher("/tunnel_wall_markers", MarkerArray, queue_size=1)
         self.target_pub = rospy.Publisher("/tunnel_target_point", Marker, queue_size=1)
 
-        self.current_mission = 0
+        self.current_mission = 0.0
         self.state = None
         
 
