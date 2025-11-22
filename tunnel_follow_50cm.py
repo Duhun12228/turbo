@@ -17,7 +17,7 @@ from geometry_msgs.msg import Point
 
 class TunnelFollower50cm:
     def __init__(self):
-
+        rospy.init_node('tunnel_follower_50cm')
         # Tunnel geometry
         self.TUNNEL_WIDTH = 0.60
         self.TUNNEL_HALF = self.TUNNEL_WIDTH / 2.0
@@ -56,6 +56,8 @@ class TunnelFollower50cm:
     def scan_callback(self, msg):
         self.scan_data = msg
 
+    def mission_cb(self, msg):
+        self.current_mission = msg.data
 
 
     # ================================================================
