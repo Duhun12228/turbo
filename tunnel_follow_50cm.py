@@ -2,9 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import rospy
-import math
+import cv2 as cv
 import numpy as np
-
+from cv_bridge import CvBridge
+from sensor_msgs.msg import CompressedImage, Image
+from ackermann_msgs.msg import AckermannDriveStamped
+import math
+import time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float64
 from visualization_msgs.msg import Marker, MarkerArray
@@ -13,8 +17,6 @@ from geometry_msgs.msg import Point
 
 class TunnelFollower50cm:
     def __init__(self):
-
-        rospy.loginfo("=== TUNNEL FOLLOWER (50cm) WITH CORRECT STEERING MAP ===")
 
         # Tunnel geometry
         self.TUNNEL_WIDTH = 0.60
@@ -31,53 +33,29 @@ class TunnelFollower50cm:
         self.LOOKAHEAD = 0.20
 
         # Speed → ERPM
-        self.BASE_SPEED = 0.1
-        self.MIN_SPEED = 0.05
-        self.ERPM_BASE = 2000.0
+        self.BASE_SPEED = 0.35
+        self.MIN_SPEED = 0.25
 
         self.scan_data = None
 
         # ROS I/O
-        rospy.Subscriber("/scan", LaserScan, self.scan_callback)
+        self.scan_sub = rospy.Subscriber("/scan", LaserScan, self.scan_callback)
+        self.ack_pub_1 = rospy.Publisher('/high_level/ackermann_cmd_mux/input/nav_1', AckermannDriveStamped, queue_size=10)
+        self.mission_sub = rospy.Subscriber(
+            '/mission_num', Float64, self.mission_cb, queue_size=1)
+        self.mission_pub = rospy.Publisher('/mission_num', Float64, queue_size=10)
 
-        self.speed_pub = rospy.Publisher("/commands/motor/speed", Float64, queue_size=1)
-        self.steer_pub = rospy.Publisher("/commands/servo/position", Float64, queue_size=1)
 
         self.viz_pub = rospy.Publisher("/tunnel_wall_markers", MarkerArray, queue_size=1)
         self.target_pub = rospy.Publisher("/tunnel_target_point", Marker, queue_size=1)
 
-        rospy.Timer(rospy.Duration(0.05), self.control_loop)
-
+        self.current_mission = 0
+        self.state = None
+        
 
     def scan_callback(self, msg):
         self.scan_data = msg
 
-
-    def control_loop(self, event):
-        if self.scan_data is None:
-            return
-
-        left_pts, right_pts = self.extract_wall_points(self.scan_data)
-
-        left_line = self.fit_line(left_pts)
-        right_line = self.fit_line(right_pts)
-
-        if left_line is None and right_line is None:
-            self.publish_drive(0.0, self.MIN_SPEED)
-            self.publish_visualization(left_pts, right_pts, None)
-            return
-
-        target = self.compute_center_target(left_line, right_line, left_pts, right_pts)
-
-        if target is None:
-            self.publish_drive(0.0, self.MIN_SPEED)
-            self.publish_visualization(left_pts, right_pts, None)
-            return
-
-        steering, speed = self.pure_pursuit(target)
-
-        self.publish_drive(steering, speed)
-        self.publish_visualization(left_pts, right_pts, target)
 
 
     # ================================================================
@@ -177,19 +155,7 @@ class TunnelFollower50cm:
     # ================================================================
     # 🚀 CORRECT SERVO MAPPING (THIS FIXES EVERYTHING)
     # ================================================================
-    def publish_drive(self, steer, speed_mps_like):
 
-        # Convert pure pursuit output to servo (0.0–1.0)
-        servo_cmd = 0.5 - (steer / self.MAX_STEER) * 0.5
-        servo_cmd = max(0.0, min(1.0, servo_cmd))
-
-        # Map speed
-        ratio = speed_mps_like / self.BASE_SPEED
-        erpm = self.ERPM_BASE * ratio
-
-        # Publish to VESC
-        self.steer_pub.publish(Float64(servo_cmd))
-        self.speed_pub.publish(Float64(erpm))
 
 
     # ================================================================
@@ -249,9 +215,69 @@ class TunnelFollower50cm:
             m.pose.position.z = 0.0
             self.target_pub.publish(m)
 
+    def publish_ack(self, speed, steering = 0.0):
+        ack = AckermannDriveStamped()
+        ack.header.stamp = rospy.Time.now()
+        ack.drive.speed = speed
+        ack.drive.steering_angle = steering
+        self.ack_pub_1.publish(ack)
 
-if __name__ == "__main__":
-    rospy.init_node("tunnel_follow_50cm", anonymous=True)
-    TunnelFollower50cm()
-    rospy.spin()
+    def main(self):
+        if self.scan_data is None:
+            return
 
+        left_pts, right_pts = self.extract_wall_points(self.scan_data)
+
+        left_line = self.fit_line(left_pts)
+        right_line = self.fit_line(right_pts)
+        
+        if self.state == None:
+            if left_line is None and right_line is None:
+                self.publish_visualization(left_pts, right_pts, None)
+                rospy.loginfo("No line detected")
+                return
+            else:
+                target = self.compute_center_target(left_line, right_line, left_pts, right_pts)
+                self.state = 'tunnel_detected'
+                steering, speed = self.pure_pursuit(target)
+                self.publish_ack(speed, steering)
+                self.publish_visualization(left_pts, right_pts, target)
+
+                rospy.loginfo('tunnel_detected!! follow start')
+                self.start_time = time.time()
+
+        elif self.state == 'tunnel_detected':
+            if left_line is None and right_line is None:
+                if time.time() - self.start_time < 3.0:
+                    rospy.loginfo('tunnel is not detected but might be some error')
+                    return
+                else:
+                    self.state = 'Done'
+                    return
+            else:
+                target = self.compute_center_target(left_line, right_line, left_pts, right_pts)
+                steering, speed = self.pure_pursuit(target)
+                self.publish_visualization(left_pts, right_pts, target)
+                self.publish_ack(speed, steering)
+
+        elif self.state == 'Done':
+            msg = Float64()
+            msg.data = 5.
+            self.current_mission = 5.
+            self.mission_pub.publish(msg)
+            rospy.loginfo('------mission 5------')
+
+
+        
+if __name__ =='__main__':
+    try:
+        tf = TunnelFollower50cm()
+        rate = rospy.Rate(25)  # 25Hz
+
+        while not rospy.is_shutdown():
+            if tf.current_mission == 4.0:
+                tf.main()
+                rate.sleep()
+
+    except rospy.ROSInterruptException:
+        pass
