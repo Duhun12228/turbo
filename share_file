@@ -7,6 +7,7 @@ import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+from sensor_msgs.msg import CompressedImage, Image
 
 
 class SignTemplateMatcher:
@@ -14,9 +15,12 @@ class SignTemplateMatcher:
         rospy.init_node('sign_template_matcher')
 
         # --- 파라미터 설정 ---
-        self.image_topic = rospy.get_param('~image_topic', '/camera/image_raw')
-        left_tpl_path = rospy.get_param('~left_template_path', 'left_template.png')
-        right_tpl_path = rospy.get_param('~right_template_path', 'right_template.png')
+        self.image_topic = rospy.get_param('~image_topic', '/usb_cam/image_rect_color/compressed')
+        left_tpl_path = rospy.get_param('~left_template_path', 'left.jpg')
+        right_tpl_path = rospy.get_param('~right_template_path', 'right.jpg')
+
+        # 템플릿 스케일 (0~1). 0.5면 가로/세로 1/2 크기
+        self.template_scale = rospy.get_param('~template_scale', 0.2)
 
         # 매칭 threshold (0~1). 너무 낮으면 오검출 많고, 너무 높으면 검출 못할 수도 있음.
         self.score_thresh = rospy.get_param('~score_thresh', 0.5)
@@ -35,23 +39,44 @@ class SignTemplateMatcher:
             rospy.signal_shutdown("Template load failed")
             return
 
-        rospy.loginfo("Left template shape:  %s", self.left_tpl.shape)
-        rospy.loginfo("Right template shape: %s", self.right_tpl.shape)
+        # --- 템플릿 리사이즈 (작게) ---
+        self.left_tpl = self.resize_template(self.left_tpl, self.template_scale)
+        self.right_tpl = self.resize_template(self.right_tpl, self.template_scale)
+
+        rospy.loginfo("Left template shape (resized):  %s", str(self.left_tpl.shape))
+        rospy.loginfo("Right template shape (resized): %s", str(self.right_tpl.shape))
 
         self.bridge = CvBridge()
 
         # Subscriber & Publisher
-        self.image_sub = rospy.Subscriber(self.image_topic, Image,
+        self.image_sub = rospy.Subscriber(self.image_topic, CompressedImage,
                                           self.image_callback, queue_size=1)
         self.dir_pub = rospy.Publisher('/sign_direction', String, queue_size=1)
 
         # 디버그용
-        self.show_debug = rospy.get_param('~show_debug', False)
+        self.show_debug = rospy.get_param('~show_debug', True)
+
+    def resize_template(self, tpl, scale):
+        """템플릿 이미지를 scale 비율로 축소 (scale<=0 이면 원본 사용)."""
+        if scale <= 0 or scale == 1.0:
+            return tpl
+
+        h, w = tpl.shape[:2]
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+
+        # 너무 작아지면 그냥 원본 사용
+        if new_w < 1 or new_h < 1:
+            rospy.logwarn("템플릿 스케일이 너무 작습니다. 원본 템플릿을 사용합니다.")
+            return tpl
+
+        resized = cv.resize(tpl, (new_w, new_h), interpolation=cv.INTER_AREA)
+        return resized
 
     def image_callback(self, msg):
         # ROS Image -> OpenCV BGR 이미지
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
             rospy.logwarn("CvBridge 변환 실패: %s", e)
             return
@@ -64,7 +89,7 @@ class SignTemplateMatcher:
         if y_max <= y_min:
             y_min, y_max = 0, h  # 이상값이면 전체 사용
 
-        roi = frame[y_min:y_max, :]
+        roi = frame[y_min:y_max, 200:420]
 
         # 그레이 변환
         roi_gray = cv.cvtColor(roi, cv.COLOR_BGR2GRAY)
