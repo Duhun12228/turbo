@@ -5,155 +5,145 @@ import rospy
 import cv2 as cv
 import numpy as np
 from cv_bridge import CvBridge
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
-from sensor_msgs.msg import CompressedImage, Image
 
 
 class SignTemplateMatcher:
     def __init__(self):
         rospy.init_node('sign_template_matcher')
 
-        # --- 파라미터 설정 ---
-        self.image_topic = rospy.get_param('~image_topic', '/usb_cam/image_rect_color/compressed')
-        left_tpl_path = rospy.get_param('~left_template_path', 'left.jpg')
-        right_tpl_path = rospy.get_param('~right_template_path', 'right.jpg')
+        # --- Parameter ---
+        self.image_topic = rospy.get_param("~image_topic", "/usb_cam/image_rect_color/compressed")
 
-        # 템플릿 스케일 (0~1). 0.5면 가로/세로 1/2 크기
-        self.template_scale = rospy.get_param('~template_scale', 0.2)
+        left_tpl_path = rospy.get_param("~left_template_path", "/mnt/data/left.jpg")
+        right_tpl_path = rospy.get_param("~right_template_path", "/mnt/data/right.jpg")
 
-        # 매칭 threshold (0~1). 너무 낮으면 오검출 많고, 너무 높으면 검출 못할 수도 있음.
-        self.score_thresh = rospy.get_param('~score_thresh', 0.5)
+        # ROI가 강제로 리사이즈될 크기
+        self.norm_size = rospy.get_param("~norm_size", 128)
 
-        # ROI 비율 (화면의 어느 부분을 표지판 후보로 볼지)
-        # 예: 화면 상단 60%만 사용
-        self.roi_y_min_ratio = rospy.get_param('~roi_y_min_ratio', 0.0)
-        self.roi_y_max_ratio = rospy.get_param('~roi_y_max_ratio', 0.6)
+        # 템플릿 매칭 threshold
+        self.score_thresh = rospy.get_param("~score_thresh", 0.5)
 
-        # --- 템플릿 로드 ---
-        self.left_tpl = cv.imread(left_tpl_path, cv.IMREAD_GRAYSCALE)
-        self.right_tpl = cv.imread(right_tpl_path, cv.IMREAD_GRAYSCALE)
+        self.show_debug = rospy.get_param("~show_debug", True)
 
-        if self.left_tpl is None or self.right_tpl is None:
-            rospy.logerr("템플릿 이미지를 불러오지 못했습니다. 경로를 확인하세요.")
+        # 색 기반 threshold (파란 원)
+        self.lower_blue = np.array([100, 60, 40])
+        self.upper_blue = np.array([130, 255, 255])
+
+        # Load templates
+        self.left_tpl_raw = cv.imread(left_tpl_path, cv.IMREAD_GRAYSCALE)
+        self.right_tpl_raw = cv.imread(right_tpl_path, cv.IMREAD_GRAYSCALE)
+
+        if self.left_tpl_raw is None or self.right_tpl_raw is None:
+            rospy.logerr("템플릿 파일 불러오기 실패!")
             rospy.signal_shutdown("Template load failed")
             return
 
-        # --- 템플릿 리사이즈 (작게) ---
-        self.left_tpl = self.resize_template(self.left_tpl, self.template_scale)
-        self.right_tpl = self.resize_template(self.right_tpl, self.template_scale)
-
-        rospy.loginfo("Left template shape (resized):  %s", str(self.left_tpl.shape))
-        rospy.loginfo("Right template shape (resized): %s", str(self.right_tpl.shape))
+        # 템플릿도 동일한 크기로 강제 리사이즈
+        self.left_tpl = cv.resize(self.left_tpl_raw, (self.norm_size, self.norm_size))
+        self.right_tpl = cv.resize(self.right_tpl_raw, (self.norm_size, self.norm_size))
 
         self.bridge = CvBridge()
 
-        # Subscriber & Publisher
         self.image_sub = rospy.Subscriber(self.image_topic, CompressedImage,
                                           self.image_callback, queue_size=1)
-        self.dir_pub = rospy.Publisher('/sign_direction', String, queue_size=1)
+        self.dir_pub = rospy.Publisher("/sign_direction", String, queue_size=1)
 
-        # 디버그용
-        self.show_debug = rospy.get_param('~show_debug', True)
+        rospy.loginfo("SignTemplateMatcher Node Started!")
 
-    def resize_template(self, tpl, scale):
-        """템플릿 이미지를 scale 비율로 축소 (scale<=0 이면 원본 사용)."""
-        if scale <= 0 or scale == 1.0:
-            return tpl
+    # ----------------------------------------------------
 
-        h, w = tpl.shape[:2]
-        new_w = int(w * scale)
-        new_h = int(h * scale)
+    def find_blue_sign_roi(self, frame):
+        """
+        파란 원형 표지판을 색 기반으로 검출 → ROI 반환
+        """
+        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+        mask = cv.inRange(hsv, self.lower_blue, self.upper_blue)
 
-        # 너무 작아지면 그냥 원본 사용
-        if new_w < 1 or new_h < 1:
-            rospy.logwarn("템플릿 스케일이 너무 작습니다. 원본 템플릿을 사용합니다.")
-            return tpl
+        # 형태학적 연산
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel, iterations=1)
+        mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel, iterations=2)
 
-        resized = cv.resize(tpl, (new_w, new_h), interpolation=cv.INTER_AREA)
-        return resized
+        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
 
-    def image_callback(self, msg):
-        # ROS Image -> OpenCV BGR 이미지
-        try:
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            rospy.logwarn("CvBridge 변환 실패: %s", e)
-            return
+        # 가장 큰 컨투어를 표지판으로 가정
+        c = max(contours, key=cv.contourArea)
+        x, y, w, h = cv.boundingRect(c)
 
-        h, w, _ = frame.shape
+        if w * h < 800:  # 너무 작은 노이즈 제거
+            return None
 
-        # --- ROI 자르기 (화면 위쪽 일부만 사용) ---
-        y_min = int(h * self.roi_y_min_ratio)
-        y_max = int(h * self.roi_y_max_ratio)
-        if y_max <= y_min:
-            y_min, y_max = 0, h  # 이상값이면 전체 사용
+        roi = frame[y:y+h, x:x+w]
+        return roi
 
-        roi = frame[y_min:y_max, 200:420]
+    # ----------------------------------------------------
 
-        # 그레이 변환
+    def template_match_direction(self, roi):
+        """
+        ROI를 강제로 고정 크기로 리사이즈 → 템플릿 매칭으로 LEFT/RIGHT 판별
+        """
         roi_gray = cv.cvtColor(roi, cv.COLOR_BGR2GRAY)
+        roi_resized = cv.resize(roi_gray, (self.norm_size, self.norm_size))
 
-        # 템플릿 크기가 ROI보다 크면 매칭 불가 -> 그냥 패스
-        if (roi_gray.shape[0] < self.left_tpl.shape[0] or
-            roi_gray.shape[1] < self.left_tpl.shape[1] or
-            roi_gray.shape[0] < self.right_tpl.shape[0] or
-            roi_gray.shape[1] < self.right_tpl.shape[1]):
-            rospy.logwarn_throttle(1.0, "ROI가 템플릿보다 작습니다. ROI 비율/카메라 해상도 확인.")
-            return
+        res_left = cv.matchTemplate(roi_resized, self.left_tpl, cv.TM_CCOEFF_NORMED)
+        res_right = cv.matchTemplate(roi_resized, self.right_tpl, cv.TM_CCOEFF_NORMED)
 
-        # --- 템플릿 매칭 ---
-        res_left = cv.matchTemplate(roi_gray, self.left_tpl, cv.TM_CCOEFF_NORMED)
-        res_right = cv.matchTemplate(roi_gray, self.right_tpl, cv.TM_CCOEFF_NORMED)
+        left_score = res_left.max()
+        right_score = res_right.max()
 
-        min_val_l, max_val_l, min_loc_l, max_loc_l = cv.minMaxLoc(res_left)
-        min_val_r, max_val_r, min_loc_r, max_loc_r = cv.minMaxLoc(res_right)
-
-        left_score = max_val_l
-        right_score = max_val_r
-
-        # 최고 점수와 방향 결정
         best_score = max(left_score, right_score)
 
         if best_score < self.score_thresh:
+            return "UNKNOWN", left_score, right_score
+
+        direction = "RIGHT" if right_score > left_score else "LEFT"
+        return direction, left_score, right_score
+
+    # ----------------------------------------------------
+
+    def image_callback(self, msg):
+        try:
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except:
+            return
+
+        # 1) 파란 원 컨투어 기반 ROI 자동 찾기
+        roi = self.find_blue_sign_roi(frame)
+
+        if roi is None:
             direction = "UNKNOWN"
+            left_score, right_score = 0, 0
         else:
-            direction = "RIGHT" if right_score > left_score else "LEFT"
+            # 2) ROI 고정 리사이즈 → 템플릿 매칭
+            direction, left_score, right_score = self.template_match_direction(roi)
 
-        # 결과 publish
-        msg_out = String()
-        msg_out.data = direction
-        self.dir_pub.publish(msg_out)
+        # Publish
+        out = String()
+        out.data = direction
+        self.dir_pub.publish(out)
 
-        rospy.loginfo_throttle(
-            0.5,
-            "direction: %s (left=%.3f, right=%.3f)",
-            direction, left_score, right_score
-        )
+        rospy.loginfo_throttle(0.5,
+            f"[SIGN] {direction} (L={left_score:.3f}, R={right_score:.3f})")
 
-        # 디버그: ROI 및 매칭 위치 시각화
+        # Debug
         if self.show_debug:
-            debug_img = roi.copy()
+            debug = frame.copy()
 
-            # 왼쪽 템플릿 위치 박스
-            top_left_l = max_loc_l
-            bottom_right_l = (top_left_l[0] + self.left_tpl.shape[1],
-                              top_left_l[1] + self.left_tpl.shape[0])
-            cv.rectangle(debug_img, top_left_l, bottom_right_l, (255, 0, 0), 2)
+            if roi is not None:
+                h, w = roi.shape[:2]
+                cv.imshow("ROI Sign", roi)
 
-            # 오른쪽 템플릿 위치 박스
-            top_left_r = max_loc_r
-            bottom_right_r = (top_left_r[0] + self.right_tpl.shape[1],
-                              top_left_r[1] + self.right_tpl.shape[0])
-            cv.rectangle(debug_img, top_left_r, bottom_right_r, (0, 255, 0), 2)
-
-            # 방향 텍스트
-            cv.putText(debug_img, f"{direction}", (10, 30),
-                       cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-            cv.imshow("sign_roi_debug", debug_img)
+            cv.putText(debug, f"{direction}", (30, 60),
+                       cv.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+            cv.imshow("Sign Debug", debug)
             cv.waitKey(1)
 
+
+# ----------------------------------------------------
 
 if __name__ == "__main__":
     node = SignTemplateMatcher()
