@@ -8,62 +8,46 @@ from ackermann_msgs.msg import AckermannDriveStamped
 
 class AutoParkingDirect:
     """
-    Simple 3-step auto parking maneuver using the SAME drive logic style
-    as lanefollow and parking_finder:
-
-      - AckermannDriveStamped
-      - speed in m/s
-      - steering in radians
-      - publishes to /high_level/ackermann_cmd_mux/input/nav_0
+    Updated for NEW COMPETITION PARKING ALGORITHM:
+        1) sharp left turn from white line
+        2) return back to white line position
+        3) drive forward EXACT 105 cm
     """
 
     def __init__(self):
-        # Do NOT call rospy.init_node() here.
-        # It will be called by the main script or by the node that imports this.
         self.ack_pub = rospy.Publisher(
             "/high_level/ackermann_cmd_mux/input/nav_0",
             AckermannDriveStamped,
             queue_size=10
         )
 
-        # ---- Parameters (tune on track as needed) ----
-        # Speeds (m/s)
-        self.reverse_speed = rospy.get_param("~reverse_speed", -0.25)   # slow reverse
-        self.forward_speed = rospy.get_param("~forward_speed", 0.20)    # slow forward
+        # ---------- NEW PARAMETERS ----------
+        # Speeds
+        self.forward_speed = rospy.get_param("~forward_speed", 0.22)
+        self.reverse_speed = rospy.get_param("~reverse_speed", -0.22)
 
-        # Steering angles (radians)
-        self.steer_angle = rospy.get_param("~steer_angle", math.radians(40.0))
-        self.counter_steer_angle = rospy.get_param("~counter_steer_angle", math.radians(-40.0))
+        # Sharp turn steering angle
+        self.sharp_left = rospy.get_param("~sharp_left", math.radians(43.0))
+        self.straight = 0.0
 
-        # Durations (seconds)
-        self.first_reverse_time = rospy.get_param("~first_reverse_time", 2.0)
-        self.counter_reverse_time = rospy.get_param("~counter_reverse_time", 2.0)
-        self.final_forward_time = rospy.get_param("~final_forward_time", 0.6)
+        # Timings (tune on track)
+        self.turn_into_time = rospy.get_param("~turn_into_time", 1.4)    # swing left
+        self.return_time = rospy.get_param("~return_time", 1.4)          # return back
+        self.forward_105_time = rospy.get_param("~forward_105_time", 1.0)  # forward 1.05m
 
-        # Control rate
+        # publish rate
         self.control_rate = rospy.get_param("~control_rate", 20.0)
 
-    # ============================================================
-    # Low-level drive helpers
-    # ============================================================
+    # --- Low-level send ---
     def send_cmd(self, speed, steering):
-        """
-        Send a single Ackermann command.
-        speed    [m/s]
-        steering [rad]
-        """
         msg = AckermannDriveStamped()
         msg.header.stamp = rospy.Time.now()
         msg.drive.speed = float(speed)
         msg.drive.steering_angle = float(steering)
         self.ack_pub.publish(msg)
 
+    # --- Hold movement for duration ---
     def timed_move(self, speed, steering, duration):
-        """
-        Hold a given speed & steering for 'duration' seconds.
-        Uses the same idea as lane-follow: continuous streaming of
-        AckermannDriveStamped at a fixed rate.
-        """
         rate = rospy.Rate(self.control_rate)
         end_time = rospy.Time.now() + rospy.Duration.from_sec(duration)
 
@@ -73,39 +57,79 @@ class AutoParkingDirect:
 
         # brief brake
         self.send_cmd(0.0, 0.0)
+        rospy.sleep(0.15)
+
+    # ============== NEW ALGORITHM ==============
+    def run_parking(self):
+        rospy.loginfo("=== NEW OFFICIAL PARKING START ===")
+
+        # --------------------------
+        # Step 1: Sharp left turn
+        # --------------------------
+        rospy.loginfo("STEP 1: Sharp LEFT swing")
+        self.timed_move(self.forward_speed, self.sharp_left, self.turn_into_time)
+
+        # --------------------------
+        # Step 2: Return to white line (reverse)
+        # --------------------------
+        rospy.loginfo("STEP 2: Returning back to white line")
+        self.timed_move(self.reverse_speed, -self.sharp_left, self.return_time)
+
+        # --------------------------
+        # Step 3: Final 105 cm forward
+        # --------------------------
+        rospy.loginfo("STEP 3: Forward EXACT 105 cm")
+        self.timed_move(self.forward_speed, 0.0, self.forward_105_time)
+
+        rospy.loginfo("=== PARKING COMPLETE ===")
+        self.send_cmd(0.0, 0.0)
         rospy.sleep(0.2)
 
-    # ============================================================
-    # Main parking routine
-    # ============================================================
-    def run_parking(self):
-        """
-        Execute a 3-step auto parking sequence:
 
-          1) Reverse with steering into the spot
-          2) Reverse with opposite steering to align in the box
-          3) Forward straight to settle / center
-        """
-        rospy.loginfo("=== AUTO PARKING DIRECT START ===")
-
-        rospy.loginfo("STEP 1 → Reverse with steering into spot")
-        self.timed_move(self.reverse_speed, self.steer_angle, self.first_reverse_time)
-
-        rospy.loginfo("STEP 2 → Reverse with counter-steer to align")
-        self.timed_move(self.reverse_speed, self.counter_steer_angle, self.counter_reverse_time)
-
-        rospy.loginfo("STEP 3 → Forward straight to settle")
-        self.timed_move(self.forward_speed, 0.0, self.final_forward_time)
-
-        rospy.loginfo("=== AUTO PARKING COMPLETE ===")
-        self.send_cmd(0.0, 0.0)
-        rospy.sleep(0.3)
-
-
-# ============================================================
-# Standalone usage (for testing only)
-# ============================================================
 if __name__ == "__main__":
     rospy.init_node("auto_parking_direct")
     ap = AutoParkingDirect()
     ap.run_parking()
+
+
+
+
+
+def run_parking(self):
+    rospy.loginfo("=== NEW OFFICIAL PARKING START ===")
+
+    # --------------------------
+    # STEP 1 → Sharp left turn into the parking area
+    # --------------------------
+    rospy.loginfo("STEP 1: Sharp LEFT swing into parking zone")
+    self.timed_move(self.forward_speed, self.sharp_left, self.turn_into_time)
+
+    # --------------------------
+    # STEP 2 → STOP & stay inside for 3 seconds
+    # --------------------------
+    rospy.loginfo("STEP 2: STOPPING inside parking zone for REQUIRED 3 seconds")
+    self.send_cmd(0.0, 0.0)   # full stop
+    rospy.sleep(3.0)
+
+    # --------------------------
+    # STEP 3 → Return back to white line (reverse)
+    # --------------------------
+    rospy.loginfo("STEP 3: Returning back to white line")
+    self.timed_move(self.reverse_speed, -self.sharp_left, self.return_time)
+
+    # --------------------------
+    # STEP 4 → Move forward EXACT 105 cm
+    # --------------------------
+    rospy.loginfo("STEP 4: Moving forward EXACT 105 cm")
+    self.timed_move(self.forward_speed, 0.0, self.forward_105_time)
+
+    # --------------------------
+    # STEP 5 → Final stop / mission complete
+    # --------------------------
+    rospy.loginfo("=== PARKING MISSION COMPLETE ===")
+    self.send_cmd(0.0, 0.0)
+    rospy.sleep(0.2)
+
+
+
+
