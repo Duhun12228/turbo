@@ -1,154 +1,409 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import rospy
 import cv2 as cv
 import numpy as np
-from cv_bridge import CvBridge
-from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import String
+import math
+import time
 
-
-class SignTemplateMatcher:
+class LaneFollowVideo:
     def __init__(self):
-        rospy.init_node('sign_template_matcher')
+        # --- 파라미터 ---
+        self.img_width  = 640
+        self.img_height = 480
 
-        # --- Parameter ---
-        self.image_topic = rospy.get_param("~image_topic", "/usb_cam/image_rect_color/compressed")
+        # HSV (화이트) 기본값
+        self.white_lower = np.array([0, 0, 150], dtype=np.uint8)
+        self.white_upper = np.array([180, 70, 255], dtype=np.uint8)
 
-        left_tpl_path = rospy.get_param("~left_template_path", "/mnt/data/left.jpg")
-        right_tpl_path = rospy.get_param("~right_template_path", "/mnt/data/right.jpg")
+        # 원근 변환 좌표 (원래 코드 그대로)
+        self.src_points = np.float32([
+            [0,   310],
+            [640, 310],
+            [0,   480],
+            [640, 480]
+        ])
+        self.dst_points = np.float32([
+            [0,   310],
+            [640, 310],
+            [225, 480],
+            [415, 480]
+        ])
 
-        # ROI가 강제로 리사이즈될 크기
-        self.norm_size = rospy.get_param("~norm_size", 128)
+        self.warp_mat = cv.getPerspectiveTransform(self.src_points, self.dst_points)
+        self.inv_warp_mat = cv.getPerspectiveTransform(self.dst_points, self.src_points)
 
-        # 템플릿 매칭 threshold
-        self.score_thresh = rospy.get_param("~score_thresh", 0.5)
+        self.gaussian_sigma = 1
+        self.gear = 3  # 3이 default
 
-        self.show_debug = rospy.get_param("~show_debug", True)
+        self.bgr = None
+        self.warp_img = None
+        self.white_img = None
+        self.filtered_img = None
 
-        # 색 기반 threshold (파란 원)
-        self.lower_blue = np.array([100, 60, 40])
-        self.upper_blue = np.array([130, 255, 255])
+    def warpping(self, img):
+        # 입력 프레임 크기를 그대로 사용해서 warp
+        h, w = img.shape[:2]
+        warp_img = cv.warpPerspective(img, self.warp_mat, (w, h))
+        return warp_img
 
-        # Load templates
-        self.left_tpl_raw = cv.imread(left_tpl_path, cv.IMREAD_GRAYSCALE)
-        self.right_tpl_raw = cv.imread(right_tpl_path, cv.IMREAD_GRAYSCALE)
+    def Gaussian_filter(self, img):
+        filtered_img = cv.GaussianBlur(img, (0, 0), self.gaussian_sigma)
+        return filtered_img
 
-        if self.left_tpl_raw is None or self.right_tpl_raw is None:
-            rospy.logerr("템플릿 파일 불러오기 실패!")
-            rospy.signal_shutdown("Template load failed")
-            return
+    def white_color_filter_hsv(self, img):
+        hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+        white_hsv = cv.inRange(hsv, self.white_lower, self.white_upper)
+        masked_img = cv.bitwise_and(img, img, mask=white_hsv)
+        return masked_img
 
-        # 템플릿도 동일한 크기로 강제 리사이즈
-        self.left_tpl = cv.resize(self.left_tpl_raw, (self.norm_size, self.norm_size))
-        self.right_tpl = cv.resize(self.right_tpl_raw, (self.norm_size, self.norm_size))
+    # 반사 등 제거 후 명확하게
+    def binary_filter(self, img):
+        gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+        _, binary = cv.threshold(gray, 100, 255, cv.THRESH_BINARY)
+        return binary
 
-        self.bridge = CvBridge()
+    def roi_set(self, img):
+        # 원래 코드: img[310:480, 0:640]
+        # 높이가 480이 아닐 수도 있지만, 슬라이싱은 자동으로 잘려서 에러는 안 남.
+        roi_img = img[310:480, 0:640]
+        return roi_img
 
-        self.image_sub = rospy.Subscriber(self.image_topic, CompressedImage,
-                                          self.image_callback, queue_size=1)
-        self.dir_pub = rospy.Publisher("/sign_direction", String, queue_size=1)
+    def cal_steering(self, yaw, error, gear=3, k=0.0015):  # 각도 rad, error px
+        gear = self.gear
 
-        rospy.loginfo("SignTemplateMatcher Node Started!")
-
-    # ----------------------------------------------------
-
-    def find_blue_sign_roi(self, frame):
-        """
-        파란 원형 표지판을 색 기반으로 검출 → ROI 반환
-        """
-        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        mask = cv.inRange(hsv, self.lower_blue, self.upper_blue)
-
-        # 형태학적 연산
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel, iterations=1)
-        mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel, iterations=2)
-
-        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        # 가장 큰 컨투어를 표지판으로 가정
-        c = max(contours, key=cv.contourArea)
-        x, y, w, h = cv.boundingRect(c)
-
-        if w * h < 800:  # 너무 작은 노이즈 제거
-            return None
-
-        roi = frame[y:y+h, x:x+w]
-        return roi
-
-    # ----------------------------------------------------
-
-    def template_match_direction(self, roi):
-        """
-        ROI를 강제로 고정 크기로 리사이즈 → 템플릿 매칭으로 LEFT/RIGHT 판별
-        """
-        roi_gray = cv.cvtColor(roi, cv.COLOR_BGR2GRAY)
-        roi_resized = cv.resize(roi_gray, (self.norm_size, self.norm_size))
-
-        res_left = cv.matchTemplate(roi_resized, self.left_tpl, cv.TM_CCOEFF_NORMED)
-        res_right = cv.matchTemplate(roi_resized, self.right_tpl, cv.TM_CCOEFF_NORMED)
-
-        left_score = res_left.max()
-        right_score = res_right.max()
-
-        best_score = max(left_score, right_score)
-
-        if best_score < self.score_thresh:
-            return "UNKNOWN", left_score, right_score
-
-        direction = "RIGHT" if right_score > left_score else "LEFT"
-        return direction, left_score, right_score
-
-    # ----------------------------------------------------
-
-    def image_callback(self, msg):
-        try:
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except:
-            return
-
-        # 1) 파란 원 컨투어 기반 ROI 자동 찾기
-        roi = self.find_blue_sign_roi(frame)
-
-        if roi is None:
-            direction = "UNKNOWN"
-            left_score, right_score = 0, 0
+        if gear == 3:
+            base_speed = 0.45
+        elif gear == 2:
+            base_speed = 0.35
         else:
-            # 2) ROI 고정 리사이즈 → 템플릿 매칭
-            direction, left_score, right_score = self.template_match_direction(roi)
+            base_speed = 0.25
 
-        # Publish
-        out = String()
-        out.data = direction
-        self.dir_pub.publish(out)
+        steering = yaw + np.arctan2(k * error, base_speed)
 
-        rospy.loginfo_throttle(0.5,
-            f"[SIGN] {direction} (L={left_score:.3f}, R={right_score:.3f})")
+        # 조향각이 크면 속도 줄이기
+        steer_abs = abs(steering)
 
-        # Debug
-        if self.show_debug:
-            debug = frame.copy()
+        angle_thresh = np.deg2rad(20.0)
+        angle_max   = np.deg2rad(40.0)
+        min_ratio   = 0.4
 
-            if roi is not None:
-                h, w = roi.shape[:2]
-                cv.imshow("ROI Sign", roi)
+        if steer_abs <= angle_thresh:
+            speed = base_speed
+        else:
+            ratio = 1.0 - (steer_abs - angle_thresh) / (angle_max - angle_thresh)
+            ratio = np.clip(ratio, min_ratio, 1.0)
+            speed = base_speed * ratio
 
-            cv.putText(debug, f"{direction}", (30, 60),
-                       cv.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-            cv.imshow("Sign Debug", debug)
-            cv.waitKey(1)
+        return steering, speed
+
+    def sliding_window(self, img, n_windows=10, margin=12, minpix=5):
+        y = img.shape[0]
+        x = img.shape[1]
+
+        histogram = np.sum(img[y // 2:, :], axis=0)
+        midpoint = int(histogram.shape[0] / 2)
+        leftx_current = np.argmax(histogram[:midpoint])
+        rightx_current = np.argmax(histogram[midpoint:]) + midpoint
+
+        window_height = int(y / n_windows)
+        nz = img.nonzero()
+
+        left_lane_inds = []
+        right_lane_inds = []
+
+        lx, ly, rx, ry = [], [], [], []
+
+        out_img = np.dstack((img, img, img)) * 255
+
+        for window in range(n_windows):
+
+            win_yl = y - (window + 1) * window_height
+            win_yh = y - window * window_height
+
+            win_xll = leftx_current - margin
+            win_xlh = leftx_current + margin
+            win_xrl = rightx_current - margin
+            win_xrh = rightx_current + margin
+
+            cv.rectangle(out_img, (win_xll, win_yl), (win_xlh, win_yh), (0, 255, 0), 2)
+            cv.rectangle(out_img, (win_xrl, win_yl), (win_xrh, win_yh), (0, 255, 0), 2)
+
+            good_left_inds = ((nz[0] >= win_yl) & (nz[0] < win_yh) &
+                              (nz[1] >= win_xll) & (nz[1] < win_xlh)).nonzero()[0]
+            good_right_inds = ((nz[0] >= win_yl) & (nz[0] < win_yh) &
+                               (nz[1] >= win_xrl) & (nz[1] < win_xrh)).nonzero()[0]
+
+            left_lane_inds.append(good_left_inds)
+            right_lane_inds.append(good_right_inds)
+
+            if len(good_left_inds) > minpix:
+                leftx_current = int(np.mean(nz[1][good_left_inds]))
+            if len(good_right_inds) > minpix:
+                rightx_current = int(np.mean(nz[1][good_right_inds]))
+
+            lx.append(leftx_current)
+            ly.append((win_yl + win_yh) / 2)
+
+            rx.append(rightx_current)
+            ry.append((win_yl + win_yh) / 2)
+
+        left_lane_inds = np.concatenate(left_lane_inds)
+        right_lane_inds = np.concatenate(right_lane_inds)
+
+        # 슬라이딩 윈도우 중심점으로 2차함수 피팅
+        lfit = np.polyfit(np.array(ly), np.array(lx), 1)
+        rfit = np.polyfit(np.array(ry), np.array(rx), 1)
+
+        out_img[nz[0][left_lane_inds], nz[1][left_lane_inds]] = [255, 0, 0]
+        out_img[nz[0][right_lane_inds], nz[1][right_lane_inds]] = [0, 0, 255]
+
+        cv.imshow("viewer", out_img)
+
+        return lfit, rfit
+
+    def cal_center_line(self, lfit, rfit):
+        """
+        lfit, rfit : np.polyfit으로 구한 왼쪽/오른쪽 차선의 1차 다항식 계수
+                     x = a*y + b 형태 (len == 2)
+        반환값:
+            yaw   : 중앙 차선의 진행 방향 각도 (라디안)
+            error : 차량(이미지 중앙) 기준, 차선 중앙의 x 오프셋(px)
+        """
+
+        # 1) 왼쪽/오른쪽 차선의 계수를 평균내서 '중앙선' 계수로 사용
+        cfit = (lfit + rfit) / 2.0  # [a, b]
+
+        # 2) 중앙선을 평가할 y 위치 선택
+        #    - 보통 이미지 아래쪽 3/4 지점에서 방향과 오프셋을 보게 함
+        if self.filtered_img is not None:
+            h, w = self.filtered_img.shape[:2]
+        else:
+            # fallback (warp 이미지 크기 기준)
+            h, w = 160, 640
+
+        y_eval = h * 0.75  # 이미지 높이의 3/4 지점
+
+        # 3) 해당 y에서 중앙선의 x 좌표 계산
+        a, b = cfit
+        x_center = a * (y_eval) + b 
+
+        # 4) 중앙선의 기울기(dx/dy) 계산 후, yaw 각도(라디안) 계산
+        #    x = a*y^2 + b*y + c  → dx/dy = 2*a*y + b
+        dx_dy = a
+        yaw = np.arctan(dx_dy)  # 전방(y 방향) 기준 x의 변화량에 대한 각도
+
+        # 5) 차량을 이미지 가로 중앙에 있다고 가정하고, 중앙선과의 오프셋 계산
+        img_center_x = w / 2.0
+        error =  - x_center + img_center_x  # >0: 중앙선이 오른쪽에 있음, <0: 왼쪽에 있음
+
+        return yaw, error
+    def draw_lane(self, image, warp_roi, inv_mat, left_fit, right_fit,warp_img0):
+            """
+            image    : 원본 BGR 이미지
+            warp_roi : ROI만 잘라낸 warp 이미지 (self.warp_img)
+            inv_mat  : self.inv_warp_mat
+            left_fit, right_fit : ROI 좌표계 기준 polyfit 결과
+            """
+
+            # 1) 전체 warp 이미지 (ROI 자르기 전)
+            if warp_img0 is not None:
+                base_warp = warp_img0
+            else:
+                # 혹시라도 warp_img0가 없으면, 기존처럼 ROI 전체를 기준으로라도 그리기
+                base_warp = warp_roi
+
+            full_h, full_w = base_warp.shape[:2]
+            roi_h, roi_w   = warp_roi.shape[:2]
+
+            # ROI가 항상 아래쪽을 자르고 있으니까:
+            #   예) full_h = 480, roi_h = 170 -> offset = 480 - 170 = 310
+            roi_offset_y = full_h - roi_h
+
+            # 2) ROI 좌표계에서 중앙선 그릴 y축
+            yMax = roi_h
+            ploty = np.linspace(0, yMax - 1, yMax)
+
+            # ROI 기준 x좌표
+            left_fitx  = left_fit[0] * ploty + left_fit[1] * ploty
+            right_fitx = right_fit[0] * ploty + right_fit[1] 
+
+            # 3) ROI y좌표를 전체 warp 좌표계로 올려 붙이기
+            ploty_full = ploty + roi_offset_y  # 여기서가 핵심!
+
+            pts_left  = np.array([np.transpose(np.vstack([left_fitx,  ploty_full]))])
+            pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty_full])))])
+
+            pts = np.hstack((pts_left, pts_right))
+
+            # 4) 전체 warp 크기의 빈 컬러 이미지 만들고 lane area 채우기
+            color_warp = np.zeros_like(base_warp).astype(np.uint8)  # full_h x full_w
+
+            cv.fillPoly(color_warp, np.int32([pts]), (0, 255, 0))
+            cv.imshow('debug',color_warp)
+            # 5) 역원근변환으로 원본 이미지 좌표계로 되돌리고 오버레이
+            newwarp = cv.warpPerspective(color_warp, inv_mat, (image.shape[1], image.shape[0]))
+            result = cv.addWeighted(image, 1, newwarp, 0.3, 0)
+
+            return result
+
+    def process_frame(self, frame):
+        self.bgr = frame.copy()
+
+        warp_img0 = self.warpping(self.bgr)
+        warp_img = self.roi_set(warp_img0)
+        g_filtered = self.Gaussian_filter(warp_img)
+        self.white_img = self.white_color_filter_hsv(g_filtered)
+        self.filtered_img = self.binary_filter(self.white_img)
+
+        lfit, rfit = self.sliding_window(self.filtered_img)
+
+        yaw, error = self.cal_center_line(lfit, rfit)
+        steering, speed = self.cal_steering(yaw=yaw, error=error)
+
+        # 원본 + 차로 영역 오버레이
+        debug2_img = self.draw_lane(self.bgr, warp_img, self.inv_warp_mat, lfit, rfit,warp_img0)
+
+        # 🔥 yaw / error 시각화된 ROI 디버그 이미지
+        yaw_debug_img = self.draw_yaw_debug(warp_img, lfit, rfit, yaw, error)
+
+        # 디버그 창들
+        cv.imshow('1 warp_img', warp_img0)
+        cv.imshow('2 roi_warp', yaw_debug_img)   # 여기만 교체!
+        cv.imshow('Binary_img', self.filtered_img)
+
+        # overlay 결과는 그대로 Result 창에서 보기
+        return debug2_img, steering, speed, yaw, error
+
+    
+
+    def draw_yaw_debug(self, roi_img, lfit, rfit, yaw, error):
+            """
+            roi_img: self.roi_set(self.warpping(..)) 한 뒤의 ROI 이미지
+            lfit, rfit: 왼/오른쪽 차선 polyfit 결과
+            yaw, error: cal_center_line에서 계산한 값
+            """
+
+            debug = roi_img.copy()
+            h, w = debug.shape[:2]
+
+            # 1) 중앙선(왼+오른쪽 평균) 곡선 그리기
+            cfit = (lfit + rfit) / 2.0
+            ploty = np.linspace(0, h - 1, h)
+            center_x = cfit[0] * ploty + cfit[1]
+
+            pts_center = np.vstack([center_x, ploty]).T.astype(np.int32)
+            pts_center = pts_center.reshape(-1, 1, 2)
+            # 빨간색 중앙선
+            cv.polylines(debug, [pts_center], False, (0, 0, 255), 2)
+
+            # 2) 차의 진행 방향 기준 수직선 (이미지 정중앙 x)
+            img_center_x = int(w / 2)
+            # 파란색 수직선
+            cv.line(debug,
+                    (img_center_x, h),   # 아래쪽
+                    (img_center_x, 0),   # 위쪽
+                    (255, 0, 0), 2)
+
+            # 3) yaw, error 표시용 기준 지점 (y_eval)
+            y_eval = int(h * 0.75)
+            x_center_eval = int(
+                cfit[0] * (y_eval) + cfit[1]  
+            )
+
+            # 노란 가로선: 중앙선 vs 이미지 중앙 사이의 오차
+            cv.line(debug,
+                    (img_center_x, y_eval),
+                    (x_center_eval, y_eval),
+                    (0, 255, 255), 2)
+
+            # 두 점 마커
+            cv.circle(debug, (img_center_x, y_eval), 4, (255, 255, 255), -1)  # 차 중심
+            cv.circle(debug, (x_center_eval, y_eval), 4, (0, 255, 0), -1)     # 중앙선
+
+            # 4) 텍스트로 yaw / error 표시
+            steer_deg = np.rad2deg(yaw)
+            text1 = f"yaw: {yaw:.3f} rad ({steer_deg:.1f} deg)"
+            text2 = f"err: {error:.1f} px"
+
+            cv.putText(debug, text1, (10, 25),
+                    cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv.LINE_AA)
+            cv.putText(debug, text2, (10, 55),
+                    cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv.LINE_AA)
+
+            return debug
 
 
-# ----------------------------------------------------
 
-if __name__ == "__main__":
-    node = SignTemplateMatcher()
-    try:
-        rospy.spin()
-    except rospy.ROSInterruptException:
-        pass
+def main():
+    # 비디오 파일 경로
+    video_path = '/songdo/output_steer.mp4'
+
+    cap = cv.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f'비디오 파일을 열 수 없습니다: {video_path}')
+        return
+
+    lane_follower = LaneFollowVideo()
+
+    paused = False  # 일시정지 상태 플래그
+    print("Controls:  [SPACE] 일시정지/재생  |  [f] 5초 스킵  |  [q] 종료")
+
+    while True:
+        # 일시정지 상태가 아닐 때만 새 프레임 읽기
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                print('비디오 끝!')
+                break
+
+            result_img, steering, speed, yaw, error = lane_follower.process_frame(frame)
+
+            # 값 확인용 출력
+            print(f'yaw: {yaw:.3f}, error: {error:.1f}, steer: {steering:.3f}, speed: {speed:.2f}')
+
+            cv.imshow('Result (overlay)', result_img)
+
+        # paused일 때는 마지막 프레임 화면 그대로 두고 키 입력만 기다림
+        delay = 0 if paused else 30  # 일시정지 중에는 키 입력 있을 때까지 대기
+        key = cv.waitKey(delay) & 0xFF
+
+        if key == ord('q'):
+            # q: 종료
+            break
+
+        elif key == ord(' '):
+            # SPACE: 일시정지 / 재생 토글
+            paused = not paused
+            if paused:
+                print("⏸ 일시정지 (SPACE 다시 누르면 재생)")
+            else:
+                print("▶ 재생")
+
+        elif key == ord('f'):
+            # f: 5초 앞으로 스킵 (fast-forward)
+            fps = cap.get(cv.CAP_PROP_FPS)
+            if fps <= 0:
+                print("⚠ FPS 정보를 가져올 수 없어 스킵 불가")
+                continue
+
+            frames_to_skip = int(5 * fps)  # 5초치 프레임 수
+            current_frame = int(cap.get(cv.CAP_PROP_POS_FRAMES))
+            target_frame = current_frame + frames_to_skip
+
+            cap.set(cv.CAP_PROP_POS_FRAMES, target_frame)
+            paused = False  # 스킵 후에는 자동 재생되도록
+            print(f"⏩ 5초 스킵 (대략 {target_frame}번째 프레임으로 이동)")
+
+    cap.release()
     cv.destroyAllWindows()
+
+    cap.release()
+    cv.destroyAllWindows()
+
+    cap.release()
+    cv.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main()
