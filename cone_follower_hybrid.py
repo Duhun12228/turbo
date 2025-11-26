@@ -60,12 +60,16 @@ class ConeCenterlineFollower:
         # 전방 장애물 → 후진 관련 파라미터 (NEW)
         # ==============================
 
-        self.FRONT_ANGLE_MARGIN = math.radians(15.0)  # ±60도 = 총 120도
-        self.FRONT_STOP_DIST = 0.35              # 25cm
-        self.REVERSE_SPEED = -0.2                    # m/s (후진이니까 음수로 publish)
-        self.REVERSE_TIME = 0.5               # 1초 동안 후진
+        # 전방 ±15도만 확인
+        self.FRONT_ANGLE_MARGIN = math.radians(15.0)  
+        self.FRONT_STOP_DIST = 0.28              # 약 28cm (너무 민감하지 않게 약간 줄임)
+        self.REVERSE_SPEED = -0.2               # m/s (후진이라 음수)
+        self.REVERSE_TIME = 0.5                 # 0.5초 동안 후진
         self.reverse_start_time = 0.0
-        self.front_blocked = False                    # 전방 25cm 이내 장애물 여부 flag
+        self.front_blocked = False              # 전방 장애물 여부 flag
+
+        # 후진 후 안정화 시간
+        self.stabilize_until = 0.0
 
         # ==============================
         # ROS I/O
@@ -125,8 +129,7 @@ class ConeCenterlineFollower:
         xs = ranges * np.cos(angles)
         ys = ranges * np.sin(angles)
 
-        # ---- 전방(±60도) 25cm 내 장애물 체크 (NEW) ----
-        # 차량 좌표계에서 각도 계산 (앞이 0 rad라고 가정)
+        # ---- 전방(±15도) 내 장애물 체크 ----
         thetas = np.arctan2(ys, xs)
         dists  = np.hypot(xs, ys)
 
@@ -253,11 +256,15 @@ class ConeCenterlineFollower:
         return delta, speed, (tx, ty)
 
     # ==============================
-    # EXP smooth (기존)
+    # EXP smooth (수정됨)
     # ==============================
 
     def exp_smooth(self, prev, new, alpha):
-        return alpha*prev + (1-alpha)*new
+        """
+        올바른 지수평활:
+        new_smooth = (1 - alpha) * prev + alpha * new
+        """
+        return (1.0 - alpha) * prev + alpha * new
 
     # ==============================
     # Ackermann driving (기존)
@@ -341,127 +348,138 @@ class ConeCenterlineFollower:
         self.target_pub.publish(t)
 
     # ==============================
-    # Main state machine
+    # Main state machine (수정됨)
     # ==============================
 
     def main(self):
-            # ---- 0) 이미 후진 중인 상태 처리 (front_blocked와 무관) ----
-            if self.state == 'reverse':
-                elapsed = time.time() - self.reverse_start_time
-                if elapsed < self.REVERSE_TIME:
-                    # 후진도 부드럽게
-                    speed_cmd = self.exp_smooth(self.last_speed, self.REVERSE_SPEED, self.SPEED_SMOOTH_ALPHA)
-                    self.last_speed = speed_cmd
-                    self.publish_drive(-self.last_steer, speed_cmd)
-                else:
-                    # 후진 끝 → 정지 명령만 보내고, last_speed는 건드리지 말기
-                    self.publish_drive(0.0, 0.0)
-                    # self.last_speed = 0.0   # <<< 이 줄 지워
+        # ---- 0) 이미 후진 중인 상태 처리 ----
+        if self.state == 'reverse':
+            elapsed = time.time() - self.reverse_start_time
+            if elapsed < self.REVERSE_TIME:
+                # 후진도 부드럽게 (직선 후진)
+                speed_cmd = self.exp_smooth(self.last_speed, self.REVERSE_SPEED, self.SPEED_SMOOTH_ALPHA)
+                self.last_speed = speed_cmd
+                self.last_steer = 0.0
+                self.publish_drive(0.0, speed_cmd)
+            else:
+                # 후진 끝 → 완전 정지 + 상태 초기화
+                self.publish_drive(0.0, 0.0)
+                self.last_speed = 0.0
+                self.last_steer = 0.0
+                self.front_blocked = False
+
+                # LiDAR/경로 안정화 시간
+                self.stabilize_until = time.time() + 0.5
+                self.state = 'stabilizing'
+            return
+
+        # ---- 0.5) 후진 직후 안정화 구간 ----
+        if self.state == 'stabilizing':
+            if time.time() < self.stabilize_until:
+                # 잠깐 그대로 멈춘 상태를 유지
+                self.publish_drive(0.0, 0.0)
+                return
+            else:
+                # 다시 정상 주행 상태로 복귀
+                self.state = None
+
+        # ---- 1) 전방 막힘이면 후진 상태 진입 ----
+        if self.front_blocked and self.state not in ('reverse', 'stabilizing'):
+            rospy.logwarn("FRONT BLOCKED -> REVERSE PHASE")
+            self.state = 'reverse'
+            self.reverse_start_time = time.time()
+            return
+
+        # ---- 2) LiDAR가 아직 준비 안 됐으면 ----
+        if self.path is None:
+            rospy.loginfo('cone111 is not detected')
+            return 
+        
+        if self.xs_roi is None or self.ys_roi is None:
+            rospy.loginfo('cone222 is not detected')
+            return
+
+        # ------------------------------
+        # STATE: 초기 (None)
+        # ------------------------------
+        if self.state is None:
+
+            if len(self.path) == 0:
+                self.publish_markers(self.xs_roi, self.ys_roi, [], None)
+                rospy.loginfo('cone333 is not detected')
+                return
+            
+            # 콘 보이는 경우
+            self.path = self.smooth_path(self.path)
+
+            steer_raw, speed_raw, target = self.pure_pursuit(self.path)
+
+            if target is None:
+                self.publish_markers(self.xs_roi, self.ys_roi, self.path, None)
+                return
+
+            steer = self.exp_smooth(self.last_steer, steer_raw, self.STEER_SMOOTH_ALPHA)
+            speed = self.exp_smooth(self.last_speed, speed_raw, self.SPEED_SMOOTH_ALPHA)
+            self.last_steer = steer
+            self.last_speed = speed
+
+            self.publish_drive(steer, speed)
+            self.publish_markers(self.xs_roi, self.ys_roi, self.path, target, self.left_pts, self.right_pts)
+            self.state = 'cone_following'
+            rospy.loginfo('cone is detected@@@')
+            
+            self.mission_fallback_time = time.time()
+        
+        # ------------------------------
+        # STATE: 콘 따라가는 중
+        # ------------------------------
+        elif self.state == 'cone_following':
+
+            if len(self.xs_roi) == 0:
+                self.publish_markers(self.xs_roi, self.ys_roi, [], None)
+                if time.time() - self.mission_fallback_time < 3.0:
+                    rospy.loginfo('cone is not detected but maybe some error') 
                     self.state = None
-                    self.front_blocked = False
-                return
-
-            if self.front_blocked and self.state != 'reverse':
-                rospy.logwarn("FRONT BLOCKED -> REVERSE PHASE")
-                self.state = 'reverse'
-                self.reverse_start_time = time.time()
-                self.reverse_start_time = time.time()
-                # 여기에서 바로 self.publish_drive(...) 하지 말고,
-                # 다음 루프에서 위의 state=='reverse' 블록이 처리하게 둠
-                return
-
-
-
-            # ---- 2) LiDAR가 아직 준비 안 됐으면 ----
-            if self.path is None:
-                rospy.loginfo('cone111 is not detected')
-                return 
-            
-            if self.xs_roi is None or self.ys_roi is None:
-                rospy.loginfo('cone222 is not detected')
-                return
-
-            # ------------------------------
-            # STATE: 초기 (None)
-            # ------------------------------
-            if self.state is None:
-
-                if len(self.path) == 0:
-                    self.publish_markers(self.xs_roi, self.ys_roi, [], None)
-                    rospy.loginfo('cone333 is not detected')
+                    return
+                else:
+                    self.state = 'Done'
                     return
                 
-                # 콘 보이는 경우
-                self.path = self.smooth_path(self.path)
+            rospy.loginfo('Following Cone@!!!')
 
-                steer_raw, speed_raw, target = self.pure_pursuit(self.path)
+            self.path = self.smooth_path(self.path)
 
-                if target is None:
-                    self.publish_markers(self.xs_roi, self.ys_roi, self.path, None)
-                    return
+            steer_raw, speed_raw, target = self.pure_pursuit(self.path)
 
-                steer = self.exp_smooth(self.last_steer, steer_raw, self.STEER_SMOOTH_ALPHA)
-                speed = self.exp_smooth(self.last_speed, speed_raw, self.SPEED_SMOOTH_ALPHA)
-                self.last_steer = steer
-                self.last_speed = speed
+            if target is None:
+                self.publish_markers(self.xs_roi, self.ys_roi, self.path, None)
+                return
 
-                self.publish_drive(steer, speed)
-                self.publish_markers(self.xs_roi, self.ys_roi, self.path, target, self.left_pts, self.right_pts)
-                self.state = 'cone_following'
-                rospy.loginfo('cone is detected@@@')
-                
-                self.mission_fallback_time = time.time()
-            
-            # ------------------------------
-            # STATE: 콘 따라가는 중
-            # ------------------------------
-            elif self.state == 'cone_following':
+            steer = self.exp_smooth(self.last_steer, steer_raw, self.STEER_SMOOTH_ALPHA)
+            speed = self.exp_smooth(self.last_speed, speed_raw, self.SPEED_SMOOTH_ALPHA)
+            self.last_steer = steer
+            self.last_speed = speed
 
-                if len(self.xs_roi) == 0:
-                    self.publish_markers(self.xs_roi, self.ys_roi, [], None)
-                    if time.time() - self.mission_fallback_time < 3.0:
-                        rospy.loginfo('cone is not detected but maybe some error') 
-                        self.state = None
-                        return
-                    else:
-                        self.state = 'Done'
-                        return
-                    
-                rospy.loginfo('Following Cone@!!!')
+            self.publish_drive(steer, speed)
+            self.publish_markers(self.xs_roi, self.ys_roi, self.path, target, self.left_pts, self.right_pts)
+        
+        # ------------------------------
+        # STATE: Done
+        # ------------------------------
+        elif self.state == 'Done':
+            rospy.loginfo('Cone follow is done...')
 
-                self.path = self.smooth_path(self.path)
-
-                steer_raw, speed_raw, target = self.pure_pursuit(self.path)
-
-                if target is None:
-                    self.publish_markers(self.xs_roi, self.ys_roi, self.path, None)
-                    return
-
-                steer = self.exp_smooth(self.last_steer, steer_raw, self.STEER_SMOOTH_ALPHA)
-                speed = self.exp_smooth(self.last_speed, speed_raw, self.SPEED_SMOOTH_ALPHA)
-                self.last_steer = steer
-                self.last_speed = speed
-
-                self.publish_drive(steer, speed)
-                self.publish_markers(self.xs_roi, self.ys_roi, self.path, target, self.left_pts, self.right_pts)
-            
-            # ------------------------------
-            # STATE: Done
-            # ------------------------------
-            elif self.state == 'Done':
-                rospy.loginfo('Cone follow is done...')
-
-                msg = Float64()
-                msg.data = 4.
-                self.current_mission = 4.
-                self.mission_pub.publish(msg)
-                rospy.loginfo('------mission 4------')
+            msg = Float64()
+            msg.data = 4.
+            self.current_mission = 4.
+            self.mission_pub.publish(msg)
+            rospy.loginfo('------mission 4------')
 
 
 if __name__ =='__main__':
     try:
         cf = ConeCenterlineFollower()
-        rate = rospy.Rate(35)  # 25Hz
+        rate = rospy.Rate(35)  # 35Hz
 
         while not rospy.is_shutdown():
             if cf.current_mission == 3.0:
@@ -469,9 +487,11 @@ if __name__ =='__main__':
                     cf.start_time = time.time()
 
                 elif time.time() - cf.start_time > 5.0: # 5초 동안은 그냥 기다림
-                    #rospy.loginfo('cone.py is running')
                     cf.main()
             rate.sleep()
 
     except rospy.ROSInterruptException:
         pass
+
+
+
