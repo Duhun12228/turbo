@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import math
+import numpy as np
+
+from sensor_msgs.msg import LaserScan
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point
+from ackermann_msgs.msg import AckermannDriveStamped
+from std_msgs.msg import Float64
+
+
+class ConeCenterlineFollower:
+    def __init__(self):
+        rospy.init_node("cone_centerline_follower")
+        rospy.loginfo("=== CONE CENTERLINE FOLLOWER (WALL-FOLLOW + CENTERLINE) ===")
+
+        # ==============================
+        # Parameters
+        # ==============================
+
+        self.ADD_PI = True
+
+        # ROI tuned a bit wide in X/Y
+        self.ROI_X_MIN = 0.20
+        self.ROI_X_MAX = 1.0
+        self.ROI_Y_MIN = -0.7
+        self.ROI_Y_MAX =  0.7
+
+        # Where we sample "slices" in front of the car
+        self.X_SAMPLES = [0.20, 0.30, 0.45, 0.60, 0.80, 1.0]
+        self.DX_WINDOW = 0.22   # small window around x_i
+
+        # Lane geometry assumptions
+        self.DEFAULT_HALF_LANE = 0.35
+        self.MIN_HALF_LANE     = 0.25
+        self.MAX_HALF_LANE     = 0.55
+
+        self.WHEELBASE = 0.28
+        self.MAX_STEER = math.radians(40.0)
+
+        # Base lookahead; we may shrink it dynamically on sharp curves
+        self.LOOKAHEAD = 0.32
+
+        # Speed profile
+        self.BASE_SPEED    = 0.35
+        self.MIN_SPEED     = 0.22
+        self.SLOWDOWN_GAIN = 0.02
+
+        self.ERPM_BASE = 1500.0
+
+        # Smoothing
+        self.STEER_SMOOTH_ALPHA = 0.10
+        self.SPEED_SMOOTH_ALPHA = 0.50
+        self.last_steer = 0.0
+        self.last_speed = 0.0
+
+        # Memory of last valid center (still used a bit in pair mode)
+        self.last_center_y = 0.0
+        self.last_lane_half = self.DEFAULT_HALF_LANE
+        self.last_valid_pair = False
+
+        # ==============================
+        # ROS I/O
+        # ==============================
+
+        rospy.Subscriber("/scan", LaserScan, self.lidar_cb, queue_size=1)
+
+        # Ackermann publisher
+        self.ack_pub = rospy.Publisher(
+            "/high_level/ackermann_cmd_mux/input/nav_0",
+            AckermannDriveStamped,
+            queue_size=10
+        )
+
+        # RViz publishers
+        self.raw_pub    = rospy.Publisher("/cone_center_raw",   Marker, queue_size=1)
+        self.left_pub   = rospy.Publisher("/cone_left_points",  Marker, queue_size=1)
+        self.right_pub  = rospy.Publisher("/cone_right_points", Marker, queue_size=1)
+        self.path_pub   = rospy.Publisher("/cone_center_path",  Marker, queue_size=1)
+        self.target_pub = rospy.Publisher("/cone_center_target",Marker, queue_size=1)
+
+        self.mission_sub = rospy.Subscriber(
+            '/mission_num', Float64, self.mission_cb, queue_size=1
+        )
+        self.mission_pub = rospy.Publisher('/mission_num', Float64, queue_size=10)
+
+        self.state = None
+        self.current_mission = 0.
+        self.xs_roi = None
+        self.ys_roi = None
+
+
+    # ==============================
+    # Mission callback
+    # ==============================
+    def mission_cb(self, msg):
+        self.current_mission = msg.data
+
+
+    # ==============================
+    # LiDAR callback
+    # ==============================
+    def lidar_cb(self, scan: LaserScan):
+        ranges = np.array(scan.ranges, dtype=float)
+        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
+
+        valid = np.isfinite(ranges)
+        ranges = ranges[valid]
+        angles = angles[valid]
+
+        if self.ADD_PI:
+            angles = angles + math.pi
+
+        xs = ranges * np.cos(angles)
+        ys = ranges * np.sin(angles)
+
+        # ROI filter
+        mask = (
+            (xs > self.ROI_X_MIN) & (xs < self.ROI_X_MAX) &
+            (ys > self.ROI_Y_MIN) & (ys < self.ROI_Y_MAX)
+        )
+        xs_roi = xs[mask]
+        ys_roi = ys[mask]
+
+        self.xs_roi = xs_roi
+        self.ys_roi = ys_roi
+
+        # Emergency avoidance if too close
+        d = np.hypot(xs_roi, ys_roi)
+        if len(d) > 0:
+            min_d = np.min(d)
+            if min_d < 0.25:
+                idx = np.argmin(d)
+                cone_y = ys_roi[idx]
+                if cone_y > 0:
+                    emergency = -self.MAX_STEER
+                else:
+                    emergency = self.MAX_STEER
+                self.publish_drive(emergency, self.MIN_SPEED)
+                rospy.logwarn("EMERGENCY AVOIDANCE TURN!")
+                self.publish_markers(xs_roi, ys_roi, [], None)
+                return
+
+        # No cones in ROI → just go straight slowly
+        if len(xs_roi) == 0:
+            self.publish_drive(0.0, self.MIN_SPEED)
+            self.publish_markers(xs_roi, ys_roi, [], None)
+            return
+
+        # Split into left/right bands
+        left_mask  = ys_roi > 0.15
+        right_mask = ys_roi < -0.15
+
+        left_pts  = np.vstack((xs_roi[left_mask],  ys_roi[left_mask])).T if np.any(left_mask) else np.empty((0, 2))
+        right_pts = np.vstack((xs_roi[right_mask], ys_roi[right_mask])).T if np.any(right_mask) else np.empty((0, 2))
+
+        # Compute path (centerline + wall-follow fallback)
+        path = self.compute_centerline_path(left_pts, right_pts)
+
+        if len(path) == 0:
+            # No reliable path → safe straight
+            self.publish_drive(0.0, self.MIN_SPEED)
+            self.publish_markers(xs_roi, ys_roi, [], None, left_pts, right_pts)
+            return
+
+        # Smooth the path a bit
+        path = self.smooth_path(path)
+
+        # Pure pursuit target
+        steer_raw, speed_raw, target = self.pure_pursuit(path)
+
+        if target is None:
+            self.publish_drive(0.0, self.MIN_SPEED)
+            self.publish_markers(xs_roi, ys_roi, path, None, left_pts, right_pts)
+            return
+
+        # Smooth steering & speed
+        steer = self.exp_smooth(self.last_steer, steer_raw, self.STEER_SMOOTH_ALPHA)
+        speed = self.exp_smooth(self.last_speed, speed_raw, self.SPEED_SMOOTH_ALPHA)
+        self.last_steer = steer
+        self.last_speed = speed
+
+        self.publish_drive(steer, speed)
+        self.publish_markers(xs_roi, ys_roi, path, target, left_pts, right_pts)
+
+
+    # ==============================
+    # Centerline + wall-follow logic
+    # ==============================
+
+    def compute_centerline_path(self, left_pts, right_pts):
+        """
+        1) If only one side is strong → wall-follow mode.
+        2) If both sides exist → normal centerline.
+        3) No fake "straight" lane when data missing; we skip invalid x-samples.
+        """
+        path = []
+
+        left_count  = len(left_pts)
+        right_count = len(right_pts)
+
+        # --------------------------
+        # 1) ONE-SIDE LEFT-WALL MODE
+        # --------------------------
+        if left_count > 5 and right_count < 2:
+            # Follow left wall with offset toward inside
+            for x_i in self.X_SAMPLES:
+                m = np.abs(left_pts[:, 0] - x_i) < self.DX_WINDOW
+                cand = left_pts[m]
+                if len(cand) == 0:
+                    continue
+                yl = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
+                center_y = yl - self.DEFAULT_HALF_LANE
+                path.append((x_i, center_y))
+
+            rospy.loginfo("Mode: LEFT-WALL FOLLOW")
+            return path
+
+        # --------------------------
+        # 2) ONE-SIDE RIGHT-WALL MODE
+        # --------------------------
+        if right_count > 5 and left_count < 2:
+            # Follow right wall with offset toward inside
+            for x_i in self.X_SAMPLES:
+                m = np.abs(right_pts[:, 0] - x_i) < self.DX_WINDOW
+                cand = right_pts[m]
+                if len(cand) == 0:
+                    continue
+                yr = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
+                center_y = yr + self.DEFAULT_HALF_LANE
+                path.append((x_i, center_y))
+
+            rospy.loginfo("Mode: RIGHT-WALL FOLLOW")
+            return path
+
+        # --------------------------
+        # 3) NORMAL CENTERLINE MODE
+        # --------------------------
+        if left_count < 2 or right_count < 2:
+            # Not enough data on either side to do reliable centerline
+            rospy.loginfo("Mode: CENTERLINE → NOT ENOUGH PAIRS")
+            return []
+
+        rospy.loginfo("Mode: CENTERLINE PAIRS")
+
+        for x_i in self.X_SAMPLES:
+            yl = None
+            yr = None
+
+            # nearest left cone around x_i
+            if len(left_pts) > 0:
+                m = np.abs(left_pts[:, 0] - x_i) < self.DX_WINDOW
+                cand = left_pts[m]
+                if len(cand) > 0:
+                    yl = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
+
+            # nearest right cone around x_i
+            if len(right_pts) > 0:
+                m = np.abs(right_pts[:, 0] - x_i) < self.DX_WINDOW
+                cand = right_pts[m]
+                if len(cand) > 0:
+                    yr = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
+
+            # Both sides present → valid pair
+            if yl is not None and yr is not None:
+                lane_width = yl - yr
+                half_lane = lane_width * 0.5
+
+                # Check lane width sanity
+                if not (self.MIN_HALF_LANE <= half_lane <= self.MAX_HALF_LANE):
+                    half_lane = self.DEFAULT_HALF_LANE
+
+                center_y = 0.5 * (yl + yr)
+                self.last_center_y = center_y
+                self.last_lane_half = half_lane
+                self.last_valid_pair = True
+
+                path.append((x_i, center_y))
+            else:
+                # ❌ We do NOT fake center using last_center_y here.
+                # If we don't have a valid pair at this x_i, we skip.
+                continue
+
+        return path
+
+
+    # ==============================
+    # Path smoothing
+    # ==============================
+
+    def smooth_path(self, pts):
+        if len(pts) < 3:
+            return pts
+        pts = np.array(pts)
+        y = pts[:, 1]
+        # Light smoothing; not too strong so we keep sharp C-shapes
+        for _ in range(1):
+            y[1:-1] = 0.25*y[:-2] + 0.5*y[1:-1] + 0.25*y[2:]
+        pts[:, 1] = y
+        return [tuple(p) for p in pts]
+
+
+    # ==============================
+    # Pure pursuit (dynamic lookahead)
+    # ==============================
+
+    def pure_pursuit(self, path):
+        pts = np.array(path)
+        if len(pts) == 0:
+            return 0.0, self.MIN_SPEED, None
+
+        d = np.linalg.norm(pts, axis=1)
+
+        # Rough curvature hint: difference in y over the path
+        if len(pts) >= 3:
+            curvature_hint = abs(pts[-1, 1] - pts[0, 1])
+        else:
+            curvature_hint = 0.0
+
+        # Dynamic lookahead: smaller on sharp curves
+        if curvature_hint > 0.4:
+            lookahead = 0.25
+        elif curvature_hint > 0.25:
+            lookahead = 0.28
+        else:
+            lookahead = self.LOOKAHEAD
+
+        idx = np.argmin(np.abs(d - lookahead))
+        if idx < 0 or idx >= len(pts):
+            return 0.0, self.MIN_SPEED, None
+
+        tx, ty = pts[idx]
+        alpha = math.atan2(ty, tx)
+        delta = math.atan2(2*self.WHEELBASE*math.sin(alpha), lookahead)
+        delta = max(-self.MAX_STEER, min(self.MAX_STEER, delta))
+
+        turn_ratio = abs(delta) / self.MAX_STEER
+        speed = self.BASE_SPEED - self.SLOWDOWN_GAIN * turn_ratio
+        speed = max(self.MIN_SPEED, speed)
+
+        return delta, speed, (tx, ty)
+
+
+    # ==============================
+    # EXP smoothing (correct form)
+    # ==============================
+
+    def exp_smooth(self, prev, new, alpha):
+        # new_smooth = (1 - alpha)*prev + alpha*new
+        return (1.0 - alpha) * prev + alpha * new
+
+
+    # ==============================
+    # Ackermann driving
+    # ==============================
+
+    def publish_drive(self, steer, speed):
+        msg = AckermannDriveStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.drive.steering_angle = float(steer)   # radians
+        msg.drive.speed = float(speed)            # m/s
+        self.ack_pub.publish(msg)
+
+
+    # ==============================
+    # RViz markers
+    # ==============================
+
+    def publish_markers(self, xs_roi, ys_roi, path, target,
+                        left_pts=None, right_pts=None):
+
+        # Raw ROI points
+        raw = Marker()
+        raw.header.frame_id = "laser"
+        raw.type = Marker.POINTS
+        raw.scale.x = raw.scale.y = 0.03
+        raw.color.r = 1.0
+        raw.color.a = 1.0
+        raw.pose.orientation.w = 1.0
+        for x, y in zip(xs_roi, ys_roi):
+            raw.points.append(Point(x=-x, y=-y, z=0))
+        self.raw_pub.publish(raw)
+
+        # Left cones (blue)
+        if left_pts is not None:
+            m = Marker()
+            m.header.frame_id = "laser"
+            m.type = Marker.POINTS
+            m.scale.x = m.scale.y = 0.05
+            m.color.b = 1.0
+            m.color.a = 1.0
+            m.pose.orientation.w = 1.0
+            for x, y in left_pts:
+                m.points.append(Point(x=-x, y=-y, z=0))
+            self.left_pub.publish(m)
+
+        # Right cones (green)
+        if right_pts is not None:
+            m = Marker()
+            m.header.frame_id = "laser"
+            m.type = Marker.POINTS
+            m.scale.x = m.scale.y = 0.05
+            m.color.g = 1.0
+            m.color.a = 1.0
+            m.pose.orientation.w = 1.0
+            for x, y in right_pts:
+                m.points.append(Point(x=-x, y=-y, z=0))
+            self.right_pub.publish(m)
+
+        # Path (cyan)
+        pm = Marker()
+        pm.header.frame_id = "laser"
+        pm.type = Marker.POINTS
+        pm.scale.x = pm.scale.y = 0.06
+        pm.color.r = 0.0
+        pm.color.g = 1.0
+        pm.color.b = 1.0
+        pm.color.a = 1.0
+        pm.pose.orientation.w = 1.0
+        for x, y in path:
+            pm.points.append(Point(x=-x, y=-y, z=0))
+        self.path_pub.publish(pm)
+
+        # Target point (red sphere)
+        t = Marker()
+        t.header.frame_id = "laser"
+        t.type = Marker.SPHERE
+        t.scale.x = t.scale.y = t.scale.z = 0.16
+        t.color.r = 1.0
+        t.color.a = 1.0
+        t.pose.orientation.w = 1.0
+        if target:
+            tx, ty = target
+            t.pose.position.x = -tx
+            t.pose.position.y = -ty
+        else:
+            t.action = Marker.DELETE
+        self.target_pub.publish(t)
+
+
+if __name__ == "__main__":
+    try:
+        ConeCenterlineFollower()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
