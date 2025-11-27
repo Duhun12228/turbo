@@ -15,7 +15,7 @@ from std_msgs.msg import Float64
 class ConeCenterlineFollower:
     def __init__(self):
         rospy.init_node("cone_centerline_follower")
-        rospy.loginfo("=== CONE CENTERLINE FOLLOWER (WALL-FOLLOW + CENTERLINE) ===")
+        rospy.loginfo("=== CONE CENTERLINE FOLLOWER (ADAPTIVE CENTERLINE + WALL-FOLLOW) ===")
 
         # ==============================
         # Parameters
@@ -23,25 +23,29 @@ class ConeCenterlineFollower:
 
         self.ADD_PI = True
 
-        # ROI tuned a bit wide in X/Y
+        # ROI – a bit tighter in Y for 0.5 m lane
         self.ROI_X_MIN = 0.20
         self.ROI_X_MAX = 1.0
-        self.ROI_Y_MIN = -0.7
-        self.ROI_Y_MAX =  0.7
+        self.ROI_Y_MIN = -0.5
+        self.ROI_Y_MAX =  0.5
 
-        # Where we sample "slices" in front of the car
+        # X "slices" in front of the car
         self.X_SAMPLES = [0.20, 0.30, 0.45, 0.60, 0.80, 1.0]
-        self.DX_WINDOW = 0.22   # small window around x_i
+        self.DX_WINDOW = 0.22
 
-        # Lane geometry assumptions
-        self.DEFAULT_HALF_LANE = 0.35
-        self.MIN_HALF_LANE     = 0.25
-        self.MAX_HALF_LANE     = 0.55
+        # Lane geometry assumptions (for ~0.5 m lane width)
+        self.DEFAULT_HALF_LANE = 0.25   # 25 cm from wall to lane center
+        self.MIN_HALF_LANE     = 0.20   # accept lanes as narrow as 40 cm
+        self.MAX_HALF_LANE     = 0.35   # and as wide as 70 cm
+
+        # ADAPTIVE half-lane (updated online when both sides are visible)
+        self.adaptive_half_lane = self.DEFAULT_HALF_LANE
+        self.HALF_LANE_ALPHA = 0.10     # how fast we adapt to new lane width
 
         self.WHEELBASE = 0.28
         self.MAX_STEER = math.radians(40.0)
 
-        # Base lookahead; we may shrink it dynamically on sharp curves
+        # Base lookahead
         self.LOOKAHEAD = 0.32
 
         # Speed profile
@@ -49,7 +53,10 @@ class ConeCenterlineFollower:
         self.MIN_SPEED     = 0.22
         self.SLOWDOWN_GAIN = 0.02
 
-        self.ERPM_BASE = 1500.0
+        # Adaptive safety distances
+        self.BASE_DANGER_DIST = 0.25    # normal emergency trigger
+        self.FAST_DANGER_DIST = 0.30    # if we are going fast
+        self.FAST_SPEED_THRESH = 0.30   # "fast" if last_speed > this
 
         # Smoothing
         self.STEER_SMOOTH_ALPHA = 0.10
@@ -57,18 +64,12 @@ class ConeCenterlineFollower:
         self.last_steer = 0.0
         self.last_speed = 0.0
 
-        # Memory of last valid center (still used a bit in pair mode)
-        self.last_center_y = 0.0
-        self.last_lane_half = self.DEFAULT_HALF_LANE
-        self.last_valid_pair = False
-
         # ==============================
         # ROS I/O
         # ==============================
 
         rospy.Subscriber("/scan", LaserScan, self.lidar_cb, queue_size=1)
 
-        # Ackermann publisher
         self.ack_pub = rospy.Publisher(
             "/high_level/ackermann_cmd_mux/input/nav_0",
             AckermannDriveStamped,
@@ -128,11 +129,28 @@ class ConeCenterlineFollower:
         self.xs_roi = xs_roi
         self.ys_roi = ys_roi
 
-        # Emergency avoidance if too close
-        d = np.hypot(xs_roi, ys_roi)
-        if len(d) > 0:
+        # ==========================================
+        # Adaptive speed-limit & emergency distance
+        # ==========================================
+        speed_limit = self.BASE_SPEED
+        danger_dist = self.BASE_DANGER_DIST
+
+        if len(xs_roi) > 0:
+            d = np.hypot(xs_roi, ys_roi)
             min_d = np.min(d)
-            if min_d < 0.25:
+
+            # 1) Speed-limit as function of min_d
+            if min_d < 0.4:
+                speed_limit = self.MIN_SPEED
+            elif min_d < 0.7:
+                speed_limit = min(speed_limit, 0.28)
+
+            # 2) Dynamic emergency threshold
+            if self.last_speed > self.FAST_SPEED_THRESH:
+                danger_dist = self.FAST_DANGER_DIST
+
+            if min_d < danger_dist:
+                # emergency avoidance – turn away from closest cone
                 idx = np.argmin(d)
                 cone_y = ys_roi[idx]
                 if cone_y > 0:
@@ -140,7 +158,7 @@ class ConeCenterlineFollower:
                 else:
                     emergency = self.MAX_STEER
                 self.publish_drive(emergency, self.MIN_SPEED)
-                rospy.logwarn("EMERGENCY AVOIDANCE TURN!")
+                rospy.logwarn("EMERGENCY AVOIDANCE TURN! min_d=%.3f", min_d)
                 self.publish_markers(xs_roi, ys_roi, [], None)
                 return
 
@@ -150,18 +168,29 @@ class ConeCenterlineFollower:
             self.publish_markers(xs_roi, ys_roi, [], None)
             return
 
-        # Split into left/right bands
+        # Split into left/right bands by Y sign
         left_mask  = ys_roi > 0.15
         right_mask = ys_roi < -0.15
 
         left_pts  = np.vstack((xs_roi[left_mask],  ys_roi[left_mask])).T if np.any(left_mask) else np.empty((0, 2))
         right_pts = np.vstack((xs_roi[right_mask], ys_roi[right_mask])).T if np.any(right_mask) else np.empty((0, 2))
 
-        # Compute path (centerline + wall-follow fallback)
+        # ==============================
+        # Compute path (centerline + wall-follow)
+        # ==============================
         path = self.compute_centerline_path(left_pts, right_pts)
 
+        # Fallback: if centerline failed, but one-wall data strong → wall-follow
         if len(path) == 0:
-            # No reliable path → safe straight
+            if len(left_pts) > 5 and len(right_pts) < 2:
+                rospy.loginfo("Fallback: LEFT-WALL FOLLOW")
+                path = self.compute_left_wall_fallback(left_pts)
+            elif len(right_pts) > 5 and len(left_pts) < 2:
+                rospy.loginfo("Fallback: RIGHT-WALL FOLLOW")
+                path = self.compute_right_wall_fallback(right_pts)
+
+        # Still nothing → safe straight
+        if len(path) == 0:
             self.publish_drive(0.0, self.MIN_SPEED)
             self.publish_markers(xs_roi, ys_roi, [], None, left_pts, right_pts)
             return
@@ -177,6 +206,9 @@ class ConeCenterlineFollower:
             self.publish_markers(xs_roi, ys_roi, path, None, left_pts, right_pts)
             return
 
+        # Apply adaptive speed limit from obstacle distance
+        speed_raw = min(speed_raw, speed_limit)
+
         # Smooth steering & speed
         steer = self.exp_smooth(self.last_steer, steer_raw, self.STEER_SMOOTH_ALPHA)
         speed = self.exp_smooth(self.last_speed, speed_raw, self.SPEED_SMOOTH_ALPHA)
@@ -191,10 +223,36 @@ class ConeCenterlineFollower:
     # Centerline + wall-follow logic
     # ==============================
 
+    def compute_left_wall_fallback(self, left_pts):
+        """Pure left-wall follow using adaptive_half_lane."""
+        path = []
+        for x_i in self.X_SAMPLES:
+            m = np.abs(left_pts[:, 0] - x_i) < self.DX_WINDOW
+            cand = left_pts[m]
+            if len(cand) == 0:
+                continue
+            yl = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
+            center_y = yl - self.adaptive_half_lane
+            path.append((x_i, center_y))
+        return path
+
+    def compute_right_wall_fallback(self, right_pts):
+        """Pure right-wall follow using adaptive_half_lane."""
+        path = []
+        for x_i in self.X_SAMPLES:
+            m = np.abs(right_pts[:, 0] - x_i) < self.DX_WINDOW
+            cand = right_pts[m]
+            if len(cand) == 0:
+                continue
+            yr = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
+            center_y = yr + self.adaptive_half_lane
+            path.append((x_i, center_y))
+        return path
+
     def compute_centerline_path(self, left_pts, right_pts):
         """
-        1) If only one side is strong → wall-follow mode.
-        2) If both sides exist → normal centerline.
+        1) If only one side is strong → wall-follow mode (using adaptive half lane).
+        2) If both sides exist → normal centerline with adaptive lane-width learning.
         3) No fake "straight" lane when data missing; we skip invalid x-samples.
         """
         path = []
@@ -206,41 +264,20 @@ class ConeCenterlineFollower:
         # 1) ONE-SIDE LEFT-WALL MODE
         # --------------------------
         if left_count > 5 and right_count < 2:
-            # Follow left wall with offset toward inside
-            for x_i in self.X_SAMPLES:
-                m = np.abs(left_pts[:, 0] - x_i) < self.DX_WINDOW
-                cand = left_pts[m]
-                if len(cand) == 0:
-                    continue
-                yl = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
-                center_y = yl - self.DEFAULT_HALF_LANE
-                path.append((x_i, center_y))
-
-            rospy.loginfo("Mode: LEFT-WALL FOLLOW")
-            return path
+            rospy.loginfo("Mode: LEFT-WALL FOLLOW (primary)")
+            return self.compute_left_wall_fallback(left_pts)
 
         # --------------------------
         # 2) ONE-SIDE RIGHT-WALL MODE
         # --------------------------
         if right_count > 5 and left_count < 2:
-            # Follow right wall with offset toward inside
-            for x_i in self.X_SAMPLES:
-                m = np.abs(right_pts[:, 0] - x_i) < self.DX_WINDOW
-                cand = right_pts[m]
-                if len(cand) == 0:
-                    continue
-                yr = cand[np.argmin(np.abs(cand[:, 0] - x_i)), 1]
-                center_y = yr + self.DEFAULT_HALF_LANE
-                path.append((x_i, center_y))
-
-            rospy.loginfo("Mode: RIGHT-WALL FOLLOW")
-            return path
+            rospy.loginfo("Mode: RIGHT-WALL FOLLOW (primary)")
+            return self.compute_right_wall_fallback(right_pts)
 
         # --------------------------
         # 3) NORMAL CENTERLINE MODE
         # --------------------------
         if left_count < 2 or right_count < 2:
-            # Not enough data on either side to do reliable centerline
             rospy.loginfo("Mode: CENTERLINE → NOT ENOUGH PAIRS")
             return []
 
@@ -269,19 +306,19 @@ class ConeCenterlineFollower:
                 lane_width = yl - yr
                 half_lane = lane_width * 0.5
 
-                # Check lane width sanity
-                if not (self.MIN_HALF_LANE <= half_lane <= self.MAX_HALF_LANE):
-                    half_lane = self.DEFAULT_HALF_LANE
+                # Adaptive lane width learning
+                if self.MIN_HALF_LANE <= half_lane <= self.MAX_HALF_LANE:
+                    self.adaptive_half_lane = (
+                        (1.0 - self.HALF_LANE_ALPHA) * self.adaptive_half_lane
+                        + self.HALF_LANE_ALPHA * half_lane
+                    )
+                else:
+                    half_lane = self.adaptive_half_lane
 
                 center_y = 0.5 * (yl + yr)
-                self.last_center_y = center_y
-                self.last_lane_half = half_lane
-                self.last_valid_pair = True
-
                 path.append((x_i, center_y))
             else:
-                # ❌ We do NOT fake center using last_center_y here.
-                # If we don't have a valid pair at this x_i, we skip.
+                # No valid pair at this x_i → skip
                 continue
 
         return path
@@ -296,8 +333,7 @@ class ConeCenterlineFollower:
             return pts
         pts = np.array(pts)
         y = pts[:, 1]
-        # Light smoothing; not too strong so we keep sharp C-shapes
-        for _ in range(1):
+        for _ in range(1):  # light smoothing
             y[1:-1] = 0.25*y[:-2] + 0.5*y[1:-1] + 0.25*y[2:]
         pts[:, 1] = y
         return [tuple(p) for p in pts]
@@ -345,11 +381,10 @@ class ConeCenterlineFollower:
 
 
     # ==============================
-    # EXP smoothing (correct form)
+    # EXP smoothing
     # ==============================
 
     def exp_smooth(self, prev, new, alpha):
-        # new_smooth = (1 - alpha)*prev + alpha*new
         return (1.0 - alpha) * prev + alpha * new
 
 
@@ -360,8 +395,8 @@ class ConeCenterlineFollower:
     def publish_drive(self, steer, speed):
         msg = AckermannDriveStamped()
         msg.header.stamp = rospy.Time.now()
-        msg.drive.steering_angle = float(steer)   # radians
-        msg.drive.speed = float(speed)            # m/s
+        msg.drive.steering_angle = float(steer)
+        msg.drive.speed = float(speed)
         self.ack_pub.publish(msg)
 
 
